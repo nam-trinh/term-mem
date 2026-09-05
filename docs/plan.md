@@ -50,7 +50,19 @@ what's the volume." If it doesn't, the capture tier ordering in
 
 ---
 
-## Phase 1 — Capture and browse
+## Phase 1 — Capture and browse ✅
+
+**Done 2026-09-05 — [phases/phase-1.md](phases/phase-1.md).** Verdict: the scope
+ships and the hook budget is met with room (p95 2.35 ms against 5 ms, and flat
+in transcript size). Two findings changed the design rather than confirming it.
+Phase 0's rule that `<command-name>` records are echoes turns out to reject real
+requests — the session that built this phase would have archived nothing — and
+unwrapping them exposed a worse trap underneath: a resumed transcript can hold
+assistant records whose prompts were never written to it, and the tree walk
+hangs them off the nearest `/clear` echo, producing a well-formed row containing
+14,870 characters of an unrelated conversation. Those records are now dropped
+*and counted*, which is honest but not a resolution. The Exit criterion's
+two-week soak is the one part still outstanding.
 
 *The first honest version. It records, and it can show you what it recorded.*
 
@@ -66,11 +78,17 @@ incorrectly is worse than useless, because the failures are silent.
 - Transcript ingest for Claude Code, keyed by `(session_id, uuid)` and
   idempotent — re-running the parser over the same file must be a no-op.
   Everything downstream depends on this being safe to retry.
-- The seven parser findings from Phase 0, each with a checked-in fixture. The
-  first task is confirming the human-prompt discriminator against a
-  bare-terminal session, which Phase 0 could not sample and which the whole
-  ingest hangs on.
+- The parser findings from Phase 0, each with a checked-in fixture. The first
+  task is confirming the human-prompt discriminator against a bare-terminal
+  session, which Phase 0 could not sample and which the whole ingest hangs on.
+  **Resolved without that sample:** a record with `origin.kind: "human"` and no
+  `promptSource` at all exists inside the entrypoint Phase 0 *did* sample, which
+  settles it — the field cannot gate ingest. See
+  [phases/phase-1.md](phases/phase-1.md) finding 1.
 - A watermark per session, so ingest is incremental rather than a full reparse.
+  **Corrected in flight:** it cannot be a resume offset, because assembly is
+  many-to-one over out-of-order records. It is a change detector, and the
+  reparse it triggers is affordable only because the hook never does it.
 - `tmem init` — create the database, register the `Stop` hook, print what is
   about to be recorded.
 - `tmem status`, `tmem doctor`, `tmem recent`, `tmem log`, `tmem show`.
@@ -83,7 +101,8 @@ incorrectly is worse than useless, because the failures are silent.
 losing an exchange, duplicating one, or noticing it running.
 
 **Budget:** hook latency under 5ms. Measured, not assumed — a hook on the turn
-boundary is in the user's way by construction.
+boundary is in the user's way by construction. **Measured: p95 2.35 ms**, and
+2.14 ms against an 8 MB transcript, because the hook enqueues rather than parses.
 
 ---
 
@@ -99,9 +118,12 @@ all three scenarios lean on. No embeddings, no fusion, nothing to configure.
 - `exchanges_fts` maintained transactionally with `exchanges` — an index that
   can drift from its table produces results that point at rows that aren't
   there.
-- Command extraction into its own table and its own FTS column, weighted above
-  prose. This is the single highest-leverage ranking decision available and it
-  costs nothing at query time.
+- The `commands` FTS column, weighted above prose. This is the single
+  highest-leverage ranking decision available and it costs nothing at query
+  time. **Extraction itself shipped in Phase 1**, not here: `tool_use` blocks
+  are mined and discarded at capture, so commands not extracted at write time
+  are unrecoverable. Only the index and the weighting were ever re-derivable.
+  See [phases/phase-1.md](phases/phase-1.md) finding 7.
 - `tmem <query>` as the default verb, with the `PATH` collision check from
   [cli.md](cli.md).
 - `--in`, `--since`, `--repo`, `--json`, `--limit`. Metadata filters run
@@ -112,7 +134,9 @@ all three scenarios lean on. No embeddings, no fusion, nothing to configure.
 - `forget` extended to `--since` and `--in`, and now responsible for the index
   and the derived command rows too.
 
-**Exit:** scenarios 1 and 2 run verbatim against a real archive. p95 query
+**Exit:** scenarios 1 and 2 run verbatim against a real archive. Phase 1 already
+carries the browse half of scenario 2 (`log --in`, `show --session`); what is
+missing is every line that begins `tmem <query>`. p95 query
 latency under 100ms on 100k exchanges — generate the synthetic archive to prove
 it rather than waiting to be surprised in year two.
 

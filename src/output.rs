@@ -47,6 +47,11 @@ pub fn fmt_datetime(ms: i64) -> String {
     )
 }
 
+/// Year, month, day for a unix-ms instant, UTC.
+pub fn civil_from_ms(ms: i64) -> (i64, i64, i64) {
+    civil_from_days(ms.div_euclid(86_400_000))
+}
+
 fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;

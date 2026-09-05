@@ -17,6 +17,18 @@ pub fn parse(spec: &str) -> Result<i64> {
         return Ok(now - now.rem_euclid(86_400_000) - 86_400_000);
     }
 
+    // A bare month name, which scenarios.md scenario 2 uses: the most recent
+    // start of that month, this year or last.
+    if let Some(m) = month_number(s) {
+        let (y, cur, _) = crate::output::civil_from_ms(now);
+        let year = if m <= cur { y } else { y - 1 };
+        if let Some(ms) = crate::capture::adapters::claude_code::parse_rfc3339_ms(&format!(
+            "{year:04}-{m:02}-01T00:00:00Z"
+        )) {
+            return Ok(ms);
+        }
+    }
+
     // `2026-03-01`
     if s.len() == 10 && s.as_bytes()[4] == b'-' && s.as_bytes()[7] == b'-' {
         if let Some(ms) =
@@ -44,6 +56,27 @@ pub fn parse(spec: &str) -> Result<i64> {
     Ok(now - n * ms)
 }
 
+fn month_number(s: &str) -> Option<i64> {
+    const MONTHS: [&str; 12] = [
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+    ];
+    MONTHS
+        .iter()
+        .position(|m| *m == s || m.starts_with(s) && s.len() >= 3)
+        .map(|i| i as i64 + 1)
+}
+
 fn split_number(s: &str) -> (Option<i64>, &str) {
     let idx = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
     if idx == 0 {
@@ -68,6 +101,18 @@ mod tests {
     #[test]
     fn iso_dates_are_absolute() {
         assert_eq!(parse("2026-03-01").unwrap(), 1_772_323_200_000);
+    }
+
+    /// scenarios.md scenario 2 types `--since january` verbatim.
+    #[test]
+    fn month_names_resolve_to_the_most_recent_such_month() {
+        let jan = parse("january").unwrap();
+        assert!(jan < crate::capture::now_ms());
+        assert_eq!(parse("jan").unwrap(), jan);
+        assert_eq!(parse("January").unwrap(), jan);
+        // Within a year of now, either this year's or last year's.
+        assert!(crate::capture::now_ms() - jan < 366 * 86_400_000);
+        assert_ne!(parse("december").unwrap(), jan);
     }
 
     #[test]
