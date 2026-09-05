@@ -68,8 +68,18 @@ fn civil_from_days(z: i64) -> (i64, i64, i64) {
 /// Collapse a path back to `~/…` — the archive stores absolute paths, but a
 /// result list of them is unreadable.
 pub fn tilde(p: &str) -> String {
-    match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() && p.starts_with(&h) => format!("~{}", &p[h.len()..]),
+    let Ok(home) = std::env::var("HOME") else {
+        return p.to_string();
+    };
+    let home = home.trim_end_matches('/');
+    if home.is_empty() || !p.starts_with(home) {
+        return p.to_string();
+    }
+    // Only at a path boundary: with HOME=/home/dev/a, the path
+    // /home/dev/a[1]/sub is not inside it and must not render as `~[1]/sub`.
+    match &p[home.len()..] {
+        "" => "~".to_string(),
+        rest if rest.starts_with('/') => format!("~{rest}"),
         _ => p.to_string(),
     }
 }

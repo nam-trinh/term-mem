@@ -97,29 +97,49 @@ fn run_hook(assistant: &str) -> Result<i32> {
 }
 
 fn run_drain(quiet: bool) -> Result<i32> {
-    let lock = queue::DrainLock::acquire(&paths::drain_lock()?)?;
+    // Wait briefly rather than giving up: an entry queued a moment after the
+    // running drainer listed the directory would otherwise sit there until some
+    // later ingest happened to reparse the file.
+    let mut lock = None;
+    for _ in 0..40 {
+        lock = queue::DrainLock::acquire(&paths::drain_lock()?)?;
+        if lock.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     let Some(_lock) = lock else {
-        return Ok(EXIT_OK); // another drainer already has it
-    };
-    let dir = paths::queue_dir()?;
-    let items = queue::drain(&dir)?;
-    if items.is_empty() {
-        if !quiet {
-            println!("queue empty");
-        }
+        eprintln!("tmem: another capture is still running; leaving the queue to it");
         return Ok(EXIT_OK);
-    }
-    // Collapse repeats: several turns in one session queue the same file.
-    let mut paths_seen: Vec<PathBuf> = Vec::new();
-    for (_, item) in &items {
-        let p = PathBuf::from(&item.transcript_path);
-        if !paths_seen.contains(&p) {
-            paths_seen.push(p);
+    };
+
+    let dir = paths::queue_dir()?;
+    let mut code = EXIT_OK;
+    let mut drained_any = false;
+    // Re-scan after each pass: turns queued while we were parsing are ours.
+    for _ in 0..16 {
+        let items = queue::drain(&dir)?;
+        if items.is_empty() {
+            break;
+        }
+        drained_any = true;
+        // Collapse repeats: several turns in one session queue the same file.
+        let mut paths_seen: Vec<PathBuf> = Vec::new();
+        for (_, item) in &items {
+            let p = PathBuf::from(&item.transcript_path);
+            if !paths_seen.contains(&p) {
+                paths_seen.push(p);
+            }
+        }
+        if run_paths(&paths_seen, true, quiet)? != EXIT_OK {
+            code = EXIT_ERROR;
+        }
+        for (entry, _) in &items {
+            let _ = std::fs::remove_file(entry);
         }
     }
-    let code = run_paths(&paths_seen, true, quiet)?;
-    for (entry, _) in &items {
-        let _ = std::fs::remove_file(entry);
+    if !drained_any && !quiet {
+        println!("queue empty");
     }
     Ok(code)
 }
@@ -145,6 +165,8 @@ fn run_paths(files: &[PathBuf], force: bool, quiet: bool) -> Result<i32> {
                 total.report.records_unknown_type += s.report.records_unknown_type;
                 total.report.prompts_found += s.report.prompts_found;
                 total.report.prompts_without_response += s.report.prompts_without_response;
+                total.report.prompts_unusable += s.report.prompts_unusable;
+                total.skipped_forgotten += s.skipped_forgotten;
                 total.report.api_errors_skipped += s.report.api_errors_skipped;
                 total.report.sidechain_records += s.report.sidechain_records;
                 total.report.orphaned_records += s.report.orphaned_records;
@@ -174,10 +196,23 @@ fn run_paths(files: &[PathBuf], force: bool, quiet: bool) -> Result<i32> {
             || r.records_unknown_type > 0
             || r.prompts_without_response > 0
             || r.api_errors_skipped > 0
+            || r.prompts_unusable > 0
         {
             println!(
-                "  skipped: {} unparsable, {} unknown-type, {} prompt(s) with no response, {} API error(s)",
-                r.records_unparsable, r.records_unknown_type, r.prompts_without_response, r.api_errors_skipped
+                "  skipped: {} unparsable, {} unknown-type, {} prompt(s) with no response, \
+                 {} unusable prompt(s), {} API error(s)",
+                r.records_unparsable,
+                r.records_unknown_type,
+                r.prompts_without_response,
+                r.prompts_unusable,
+                r.api_errors_skipped
+            );
+        }
+        if total.skipped_forgotten > 0 {
+            println!(
+                "  note: {} exchange(s) left out because you forgot them; the transcript \
+                 still has them, term-mem will not",
+                total.skipped_forgotten
             );
         }
         if r.orphaned_records > 0 {

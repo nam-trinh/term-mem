@@ -9,7 +9,7 @@ pub mod queue;
 
 use adapters::{Adapter, ParseReport, ParsedExchange};
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -18,6 +18,8 @@ pub struct IngestStats {
     pub files_parsed: usize,
     pub files_skipped_unchanged: usize,
     pub files_ignored: usize,
+    /// Exchanges the transcript still holds but the user has deleted.
+    pub skipped_forgotten: usize,
     pub inserted: usize,
     pub updated: usize,
     pub report: ParseReport,
@@ -30,6 +32,7 @@ impl IngestStats {
         self.report.records_unknown_type += r.records_unknown_type;
         self.report.prompts_found += r.prompts_found;
         self.report.prompts_without_response += r.prompts_without_response;
+        self.report.prompts_unusable += r.prompts_unusable;
         self.report.api_errors_skipped += r.api_errors_skipped;
         self.report.sidechain_records += r.sidechain_records;
         self.report.orphaned_records += r.orphaned_records;
@@ -110,6 +113,7 @@ pub fn ingest_file(
             Written::Inserted => stats.inserted += 1,
             Written::Updated => stats.updated += 1,
             Written::Unchanged => {}
+            Written::Forgotten => stats.skipped_forgotten += 1,
         }
     }
     tx.execute(
@@ -137,6 +141,7 @@ enum Written {
     Inserted,
     Updated,
     Unchanged,
+    Forgotten,
 }
 
 /// The idempotency point. Keyed on the adapter-declared
@@ -148,19 +153,40 @@ fn write_exchange(
     assistant: &str,
     ex: &ParsedExchange,
 ) -> Result<Written> {
-    let existing: Option<(String, String)> = tx
+    // The transcript outlives the row, so a forgotten exchange would otherwise
+    // come straight back on the next ingest of the same file.
+    let tombstoned: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM forgotten \
+         WHERE assistant = ?1 AND session_id = ?2 AND source_key = ?3)",
+        params![assistant, &ex.session_id, &ex.source_key],
+        |r| r.get::<_, i64>(0),
+    )? != 0;
+    if tombstoned {
+        return Ok(Written::Forgotten);
+    }
+
+    // The derived counts come back with the row: an exchange whose response text
+    // is unchanged can still have gained a tool call, and skipping the re-derive
+    // on text alone would drop it permanently — the raw `tool_use` block is
+    // never stored, so nothing can recover it later.
+    let existing: Option<(String, String, i64, i64)> = tx
         .query_row(
-            "SELECT id, response FROM exchanges \
-             WHERE assistant = ?1 AND session_id = ?2 AND source_key = ?3",
+            "SELECT id, response, \
+               (SELECT COUNT(*) FROM commands  WHERE exchange_id = exchanges.id), \
+               (SELECT COUNT(*) FROM file_refs WHERE exchange_id = exchanges.id) \
+             FROM exchanges WHERE assistant = ?1 AND session_id = ?2 AND source_key = ?3",
             params![assistant, &ex.session_id, &ex.source_key],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
-        .ok();
+        .optional()?;
 
     let repo = resolve_repo(Path::new(&ex.cwd));
 
-    if let Some((id, prev_response)) = existing {
-        if prev_response == ex.response {
+    if let Some((id, prev_response, n_cmds, n_files)) = existing {
+        if prev_response == ex.response
+            && n_cmds == ex.commands.len() as i64
+            && n_files == ex.files.len() as i64
+        {
             return Ok(Written::Unchanged);
         }
         tx.execute(

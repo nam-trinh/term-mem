@@ -6,7 +6,7 @@
 //! rather than a comment.
 
 use super::{Adapter, Command, DedupKey, FileRef, ParseReport, ParsedExchange};
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -300,12 +300,20 @@ impl Adapter for ClaudeCode {
                 continue;
             }
             report.prompts_found += 1;
-            let uuid = r
-                .uuid
-                .clone()
-                .ok_or_else(|| anyhow!("{path}: user prompt record without a uuid"))?;
-            let ts = parse_rfc3339_ms(r.timestamp.as_deref().unwrap_or_default())
-                .ok_or_else(|| anyhow!("{path}: prompt {uuid} has no usable timestamp"))?;
+            // Loud, but not fatal — the same rule the malformed-line handler
+            // above follows. Erroring here would discard every other exchange
+            // in the file over one unusable record, and capture is the half of
+            // this system that cannot be redone later.
+            let Some(uuid) = r.uuid.clone() else {
+                eprintln!("tmem: {path}: user prompt record without a uuid; skipped");
+                report.prompts_unusable += 1;
+                continue;
+            };
+            let Some(ts) = parse_rfc3339_ms(r.timestamp.as_deref().unwrap_or_default()) else {
+                eprintln!("tmem: {path}: prompt {uuid} has no usable timestamp; skipped");
+                report.prompts_unusable += 1;
+                continue;
+            };
             prompt_idx.insert(uuid.clone(), out.len());
             out.push(ParsedExchange {
                 session_id: session_id.clone(),

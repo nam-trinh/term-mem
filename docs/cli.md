@@ -136,11 +136,15 @@ tmem forget --since '1 hour ago'    Phase 2
 tmem forget --in <path>             Phase 2
 ```
 
-`forget` confirms interactively and takes `-y`/`--yes` to skip that; on a pipe
-it does not prompt at all. It deletes the row, its mined commands and its file
-references in one transaction, checkpoints the WAL and `VACUUM`s, so the text is
-not recoverable from a free page — which an integration test checks by grepping
-the raw database file afterwards.
+`forget` confirms interactively and takes `-y`/`--yes` to skip that. The prompt
+is gated on *stdin* being a terminal, not stdout, so `tmem forget <id> | tee log`
+still asks. It deletes the row, its mined commands and its file references in one
+transaction, checkpoints the WAL and `VACUUM`s, so the text is not recoverable
+from a free page — which an integration test checks by grepping the raw database
+file afterwards.
+
+It also records the deleted exchange's dedup key, and only that, so the next
+ingest of the same transcript does not put it back. `status` shows the count.
 
 These are genuine deletes, including from the search index — never a hidden
 flag on a row that stays on disk.

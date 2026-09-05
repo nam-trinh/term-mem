@@ -79,6 +79,10 @@ CREATE TABLE file_refs (               -- an Edit is a path, never a body
   exchange_id TEXT, seq INTEGER, path TEXT, tool TEXT
 );
 
+CREATE TABLE forgotten (               -- keys of deleted exchanges, no content
+  assistant TEXT, session_id TEXT, source_key TEXT, forgotten_at INTEGER
+);
+
 CREATE TABLE watermarks (              -- one row per transcript file
   assistant TEXT, source_path TEXT, session_id TEXT,
   bytes INTEGER, mtime_ms INTEGER, exchanges INTEGER, updated_at INTEGER
@@ -130,6 +134,14 @@ at rank time.
 so the text isn't recoverable from a free page. No `deleted=1` flag on a row
 that stays greppable on disk — a tool that keeps a "deleted" secret around is
 worse than one that never stored it.
+
+**But the transcript outlives the row**, and ingest reparses whole files, so a
+delete that touches only the database is undone by the user's next turn. The
+`forgotten` table holds the adapter's dedup key for every deleted exchange and
+nothing else — no prompt, no response, no commands — which is what makes the
+delete stick without keeping the secret. This is the one place a tombstone is
+correct, and it was missed in the first Phase 1 commit: see
+[phases/phase-1.md](phases/phase-1.md) finding 9.
 
 **Encryption is opt-in and has a cost the user is told about.** SQLCipher makes
 the file useless to `grep`, `sqlite3`, and every other tool the mission promises

@@ -82,15 +82,26 @@ pub fn run(backfill: bool, no_hook: bool) -> Result<i32> {
         let ignores = crate::cli::ignore::load()?;
         let adapter = ClaudeCode;
         let mut total = 0usize;
+        let mut failed = 0usize;
         for f in &files {
-            let s = capture::ingest_file(&mut conn, &adapter, f, &ignores, true)?;
-            total += s.inserted;
+            // Log and continue, as `capture` does: one unreadable transcript
+            // must not cost the user the other months of history.
+            match capture::ingest_file(&mut conn, &adapter, f, &ignores, true) {
+                Ok(s) => total += s.inserted,
+                Err(e) => {
+                    eprintln!("tmem: {}: {e:#}", f.display());
+                    failed += 1;
+                }
+            }
         }
         println!(
             "  backfill    {} exchanges from {} transcripts",
             total,
-            files.len()
+            files.len() - failed
         );
+        if failed > 0 {
+            println!("  skipped     {failed} transcript(s) that could not be read (see above)");
+        }
     } else {
         println!();
         println!("  Run `tmem init --backfill` to import the transcripts already on disk.");

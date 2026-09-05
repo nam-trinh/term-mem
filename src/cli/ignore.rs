@@ -68,10 +68,8 @@ pub fn run(path: Option<PathBuf>, list: bool, remove: Option<PathBuf>) -> Result
         }
         println!("ignoring {}", crate::output::tilde(&p.to_string_lossy()));
         println!("nothing under that tree will be recorded from now on.");
-        println!(
-            "already-recorded exchanges are untouched — use `tmem forget --in {}` for those.",
-            p.display()
-        );
+        println!("already-recorded exchanges are untouched. `tmem forget <id>` removes");
+        println!("them one at a time; `tmem forget --in <path>` arrives in Phase 2.");
     }
     Ok(crate::output::EXIT_OK)
 }

@@ -77,6 +77,8 @@ pub struct ParseReport {
     pub records_unknown_type: usize,
     pub prompts_found: usize,
     pub prompts_without_response: usize,
+    /// Prompts skipped for want of a uuid or a usable timestamp.
+    pub prompts_unusable: usize,
     pub api_errors_skipped: usize,
     pub sidechain_records: usize,
     /// Assistant records with no human prompt anywhere up the chain. Their text

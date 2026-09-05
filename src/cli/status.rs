@@ -50,6 +50,10 @@ pub fn status() -> Result<i32> {
     // docs/plan.md Phase 3: the redaction count is visible here, because silent
     // redaction leaves the user unable to tell a mangled response from a bad one.
     println!("  redacted    {redacted}   (redaction lands in Phase 3)");
+    let forgotten = queries::forgotten_count(&conn)?;
+    if forgotten > 0 {
+        println!("  forgotten   {forgotten}   (kept as keys only, so re-ingest cannot undo it)");
+    }
     println!("  encrypted   no    (opt-in encryption lands in Phase 3)");
 
     // Pause state must be visible.
@@ -144,7 +148,7 @@ pub fn doctor() -> Result<i32> {
 
     if db_path.exists() {
         let conn = db::open(&db_path)?;
-        report_coverage(&conn, &transcripts)?;
+        problems += report_coverage(&conn, &transcripts)?;
     }
 
     println!();
@@ -160,7 +164,8 @@ pub fn doctor() -> Result<i32> {
 /// What ingest has and has not seen. This is the part that makes a silent
 /// parser failure loud: a transcript on disk with no watermark row means the
 /// file was never read, and that is invisible from `status` alone.
-fn report_coverage(conn: &Connection, transcripts: &[std::path::PathBuf]) -> Result<()> {
+fn report_coverage(conn: &Connection, transcripts: &[std::path::PathBuf]) -> Result<usize> {
+    let mut problems = 0;
     let mut unseen = 0;
     let mut stale = 0;
     for t in transcripts {
@@ -182,7 +187,7 @@ fn report_coverage(conn: &Connection, transcripts: &[std::path::PathBuf]) -> Res
         }
     }
     if unseen > 0 {
-        bad(&format!(
+        problems += bad(&format!(
             "{unseen} transcript(s) never ingested — `tmem init --backfill`"
         ));
     } else if !transcripts.is_empty() {
@@ -191,7 +196,7 @@ fn report_coverage(conn: &Connection, transcripts: &[std::path::PathBuf]) -> Res
     if stale > 0 {
         println!("  ·  {stale} transcript(s) have grown since the last ingest (a `tmem capture --drain` away)");
     }
-    Ok(())
+    Ok(problems)
 }
 
 fn hook_is_on_path() -> bool {

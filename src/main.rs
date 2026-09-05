@@ -69,7 +69,7 @@ enum Command {
         #[command(flatten)]
         browse: cli::BrowseArgs,
     },
-    /// Everything from a directory tree, oldest context first
+    /// Everything from a directory tree, newest first
     Log {
         #[command(flatten)]
         browse: cli::BrowseArgs,

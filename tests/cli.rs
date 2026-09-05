@@ -481,3 +481,267 @@ fn a_malformed_transcript_line_does_not_stop_the_ingest() {
     e.ingest("malformed-line.jsonl");
     assert_eq!(e.count("exchanges"), 1);
 }
+
+// ── regressions from the review of PR #1 ────────────────────────────────
+//
+// Every test below reproduces a bug that shipped in the first Phase 1 commit
+// and that none of the tests above caught, because they asserted the paths the
+// code was designed for rather than the ones it would actually be walked down.
+
+/// The worst of them: `forget` deleted the row, but the transcript it came from
+/// is still on disk and the hook reparses the whole file, so the user's very
+/// next turn put the exchange straight back.
+#[test]
+fn a_forgotten_exchange_survives_the_next_hook_ingest() {
+    let e = Env::new();
+    e.cmd().args(["init", "--no-hook"]).assert().success();
+    let p = e.ingest("finding-09-many-to-one.jsonl");
+    assert_eq!(e.count("exchanges"), 1);
+
+    e.cmd().args(["forget", "--last", "-y"]).assert().success();
+    assert_eq!(e.count("exchanges"), 0);
+
+    // The next Stop hook for that same session.
+    let payload = format!(
+        r#"{{"session_id":"s","cwd":"/home/dev","transcript_path":"{}"}}"#,
+        p.display()
+    );
+    e.cmd()
+        .args(["capture", "--hook", "claude-code"])
+        .env("TMEM_NO_SPAWN", "1")
+        .write_stdin(payload)
+        .assert()
+        .success();
+    e.cmd().args(["capture", "--drain"]).assert().success();
+    assert_eq!(e.count("exchanges"), 0, "the forgotten exchange came back");
+
+    // And a forced reparse, which is what `--path` and backfill both do.
+    e.cmd()
+        .args(["capture", "--path"])
+        .arg(&p)
+        .assert()
+        .success();
+    assert_eq!(e.count("exchanges"), 0);
+    e.cmd()
+        .args(["init", "--backfill", "--no-hook"])
+        .assert()
+        .success();
+    assert_eq!(e.count("exchanges"), 0);
+
+    // The tombstone keeps keys, never content.
+    let cols = e.query("SELECT source_key FROM forgotten");
+    assert_eq!(cols.len(), 1);
+    let raw = std::fs::read(e.db()).unwrap();
+    let needle = b"holds all four clips";
+    assert!(!raw.windows(needle.len()).any(|w| w == needle));
+}
+
+/// `--in` was interpolated into a SQLite GLOB pattern, so a path containing
+/// `*`, `?` or `[` silently matched nothing — the exact failure scenarios.md
+/// warns about, where the archive looks like it lost the exchange.
+#[test]
+fn in_filter_treats_a_path_as_a_path_not_a_pattern() {
+    let e = Env::new();
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/claude_code/finding-09-many-to-one.jsonl"),
+    )
+    .unwrap();
+    let dst = e.projects().join("proj/brackets.jsonl");
+    std::fs::write(
+        &dst,
+        src.replace("/home/dev/talks/pycon-2026", "/home/dev/a[1]/sub")
+            .replace("s-finding-09-many-to-one", "s-brackets"),
+    )
+    .unwrap();
+    e.cmd()
+        .args(["capture", "--path"])
+        .arg(&dst)
+        .assert()
+        .success();
+
+    e.cmd()
+        .args(["log", "--in", "/home/dev/a[1]"])
+        .assert()
+        .code(0);
+    e.cmd()
+        .args(["log", "--in", "/home/dev/a[1]/sub"])
+        .assert()
+        .code(0);
+    // And still no prefix bleed into a sibling.
+    e.cmd()
+        .args(["log", "--in", "/home/dev/a"])
+        .assert()
+        .code(1);
+}
+
+/// The "unchanged" short-circuit compared response text only, so a tool call
+/// appended after the last text block was dropped — and the raw `tool_use`
+/// block is never stored, so nothing could recover it.
+#[test]
+fn a_tool_call_appended_after_the_last_text_block_is_not_lost() {
+    let e = Env::new();
+    let p = e.install("finding-09-many-to-one.jsonl");
+    let full = std::fs::read_to_string(&p).unwrap();
+    e.cmd()
+        .args(["capture", "--path"])
+        .arg(&p)
+        .assert()
+        .success();
+    let before = e.count("commands");
+
+    // A further round trip that adds a command but no prose.
+    let extra = r#"{"type":"assistant","uuid":"tX","parentUuid":"u1","sessionId":"s-finding-09-many-to-one","timestamp":"2026-03-03T14:22:30.000Z","cwd":"/home/dev/talks/pycon-2026","gitBranch":"main","isSidechain":false,"message":{"role":"assistant","model":"claude-opus-5","content":[{"type":"tool_use","id":"tuX","name":"Bash","input":{"command":"ffmpeg -version"}}]}}"#;
+    std::fs::write(&p, format!("{full}{extra}\n")).unwrap();
+    e.cmd()
+        .args(["capture", "--path"])
+        .arg(&p)
+        .assert()
+        .success();
+
+    assert_eq!(e.rows().len(), 1, "still one exchange");
+    assert_eq!(
+        e.count("commands"),
+        before + 1,
+        "the new command was dropped"
+    );
+    assert!(e
+        .query("SELECT cmd FROM commands")
+        .iter()
+        .any(|c| c == "ffmpeg -version"));
+}
+
+/// A prompt record with no uuid used to error out of the parse, discarding
+/// every other exchange in the file.
+#[test]
+fn an_unusable_prompt_record_costs_only_itself() {
+    let e = Env::new();
+    let p = e.install("finding-09-many-to-one.jsonl");
+    let full = std::fs::read_to_string(&p).unwrap();
+    let broken = r#"{"type":"user","parentUuid":null,"sessionId":"s-finding-09-many-to-one","timestamp":"2026-03-03T14:00:00.000Z","cwd":"/home/dev/talks/pycon-2026","origin":{"kind":"human"},"message":{"role":"user","content":[{"type":"text","text":"a prompt with no uuid at all"}]}}"#;
+    std::fs::write(&p, format!("{broken}\n{full}")).unwrap();
+    e.cmd()
+        .args(["capture", "--path"])
+        .arg(&p)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 unusable prompt"));
+    assert_eq!(e.count("exchanges"), 1, "the rest of the file must survive");
+}
+
+/// A second drainer used to give up rather than wait, abandoning whatever was
+/// queued after the first one listed the directory.
+#[test]
+fn a_blocked_drainer_reports_rather_than_silently_dropping_the_queue() {
+    let e = Env::new();
+    e.cmd().args(["init", "--no-hook"]).assert().success();
+    let lock = e.home().join("data/drain.lock");
+    std::fs::write(&lock, "99999").unwrap();
+    let p = e.install("finding-09-many-to-one.jsonl");
+    let payload = format!(
+        r#"{{"session_id":"s","cwd":"/home/dev","transcript_path":"{}"}}"#,
+        p.display()
+    );
+    e.cmd()
+        .args(["capture", "--hook", "claude-code"])
+        .env("TMEM_NO_SPAWN", "1")
+        .write_stdin(payload)
+        .assert()
+        .success();
+    e.cmd()
+        .args(["capture", "--drain"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("still running"));
+    // The queue entry is still there for whoever holds the lock.
+    assert_eq!(e.count("exchanges"), 0);
+    std::fs::remove_file(&lock).unwrap();
+    e.cmd().args(["capture", "--drain"]).assert().success();
+    assert_eq!(e.count("exchanges"), 1);
+}
+
+/// `init --backfill` used `?` in its loop, so one unreadable transcript aborted
+/// the whole import.
+#[test]
+fn backfill_skips_an_unreadable_transcript_and_imports_the_rest() {
+    let e = Env::new();
+    e.install("finding-09-many-to-one.jsonl");
+    // A directory where a transcript should be: readable as an entry, not as a file.
+    std::fs::create_dir(e.projects().join("proj/broken.jsonl")).unwrap();
+    e.cmd()
+        .args(["init", "--backfill", "--no-hook"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("skipped     1 transcript"));
+    assert_eq!(e.count("exchanges"), 1);
+}
+
+/// `doctor` printed the problem and then said capture looked healthy.
+#[test]
+fn doctor_counts_an_uningested_transcript_as_a_problem() {
+    let e = Env::new();
+    e.cmd().args(["init", "--no-hook"]).assert().success();
+    e.install("finding-09-many-to-one.jsonl");
+    e.cmd()
+        .arg("doctor")
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("never ingested"))
+        .stdout(predicate::str::contains("looks healthy").not());
+}
+
+/// `~` collapsing was a raw prefix match, so HOME=/home/dev/a rendered
+/// /home/dev/a[1]/sub as `~[1]/sub`.
+#[test]
+fn tilde_only_collapses_at_a_path_boundary() {
+    let e = Env::new();
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/claude_code/finding-09-many-to-one.jsonl"),
+    )
+    .unwrap();
+    let dst = e.projects().join("proj/home.jsonl");
+    std::fs::write(
+        &dst,
+        src.replace("/home/dev/talks/pycon-2026", "/home/dev/a[1]/sub")
+            .replace("s-finding-09-many-to-one", "s-home"),
+    )
+    .unwrap();
+    e.cmd()
+        .args(["capture", "--path"])
+        .arg(&dst)
+        .assert()
+        .success();
+    e.cmd()
+        .args(["recent", "-n", "1"])
+        .env("HOME", "/home/dev/a")
+        .assert()
+        .stdout(predicate::str::contains("/home/dev/a[1]/sub"));
+    e.cmd()
+        .args(["recent", "-n", "1"])
+        .env("HOME", "/home/dev/a[1]")
+        .assert()
+        .stdout(predicate::str::contains("~/sub"));
+}
+
+/// `ignore` advertised `forget --in`, which does not exist until Phase 2.
+#[test]
+fn ignore_does_not_advertise_a_flag_that_does_not_exist() {
+    let e = Env::new();
+    let out = e
+        .cmd()
+        .args(["ignore", "/home/dev/talks"])
+        .assert()
+        .success();
+    let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert!(
+        s.contains("Phase 2"),
+        "the phase it arrives in should be named"
+    );
+    // Whatever it suggests must actually run.
+    e.cmd()
+        .args(["forget", "--in", "/home/dev/talks"])
+        .assert()
+        .code(2);
+    assert!(!s.contains("use `tmem forget --in"));
+}

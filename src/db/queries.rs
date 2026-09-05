@@ -80,9 +80,19 @@ impl Filter {
         if let Some(p) = &self.in_path {
             // Prefix match on the directory tree, with the separator appended so
             // `--in ~/src/api` does not also match `~/src/api-legacy`.
-            sql.push_str(" AND (cwd = ? OR cwd GLOB ?)");
-            args.push(Box::new(p.clone()));
-            args.push(Box::new(format!("{}/*", p.trim_end_matches('/'))));
+            //
+            // Compared with `substr`, not `GLOB` or `LIKE`: a path is user data
+            // and may contain `*`, `?` or `[`, which a pattern match would treat
+            // as wildcards. That fails *silently* — `--in '/home/a[1]'` returns
+            // nothing and looks like the archive lost the exchange, which is the
+            // exact failure docs/scenarios.md warns about. `LIKE` is no better;
+            // it is also ASCII-case-insensitive, and paths are not.
+            let dir = p.trim_end_matches('/');
+            let prefix = format!("{dir}/");
+            sql.push_str(" AND (cwd = ? OR substr(cwd, 1, ?) = ?)");
+            args.push(Box::new(dir.to_string()));
+            args.push(Box::new(prefix.chars().count() as i64));
+            args.push(Box::new(prefix));
         }
         if let Some(t) = self.since_ms {
             sql.push_str(" AND ts >= ?");
@@ -172,10 +182,28 @@ pub fn last_id(conn: &Connection) -> Result<Option<String>> {
 /// A genuine delete: the row and every derived artifact, in one transaction,
 /// followed by VACUUM so the text is not recoverable from a free page.
 /// Callers must not add a `deleted` flag here. See docs/mission.md.
+///
+/// A tombstone of the adapter's dedup key is kept, and only that — otherwise
+/// the next ingest of the same transcript puts the exchange straight back.
 pub fn forget(conn: &mut Connection, ids: &[String]) -> Result<usize> {
+    let now = crate::capture::now_ms();
     let tx = conn.transaction()?;
     let mut n = 0;
     for id in ids {
+        let key: Option<(String, String, String)> = tx
+            .query_row(
+                "SELECT assistant, session_id, source_key FROM exchanges WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        if let Some((assistant, session, source)) = key {
+            tx.execute(
+                "INSERT INTO forgotten (assistant, session_id, source_key, forgotten_at) \
+                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING",
+                params![assistant, session, source, now],
+            )?;
+        }
         tx.execute("DELETE FROM commands  WHERE exchange_id = ?1", params![id])?;
         tx.execute("DELETE FROM file_refs WHERE exchange_id = ?1", params![id])?;
         n += tx.execute("DELETE FROM exchanges WHERE id = ?1", params![id])?;
@@ -187,6 +215,10 @@ pub fn forget(conn: &mut Connection, ids: &[String]) -> Result<usize> {
     conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
     conn.execute_batch("VACUUM")?;
     Ok(n)
+}
+
+pub fn forgotten_count(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("SELECT COUNT(*) FROM forgotten", [], |r| r.get(0))?)
 }
 
 pub fn count(conn: &Connection) -> Result<i64> {

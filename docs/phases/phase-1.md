@@ -214,9 +214,53 @@ number would not survive parsing in the hook: a full reparse of the 8 MB file
 takes far longer than the budget, which is precisely why finding 5's whole-file
 reparse is affordable only off the turn boundary.
 
+## 9. A review found eleven bugs the tests were built to miss
+
+The phase shipped with 56 passing tests, clean clippy, and a measured budget —
+and a review of the resulting PR found eleven defects, three of which lose data.
+That gap is the most useful thing in this document.
+
+The tests asserted the paths the code was *designed for*. Every finding below
+lives on a path the design never contemplated:
+
+1. **`forget` was undone by the next Stop hook.** The row was deleted, but the
+   transcript is still on disk and the hook reparses whole files (finding 5), so
+   the exchange was re-inserted on the user's very next turn. The deletion test
+   checked the moment after the delete and stopped there. Fixed with a
+   `forgotten` table holding dedup keys and no content.
+2. **`--in` silently matched nothing** for any path containing `*`, `?` or `[`,
+   because it was interpolated into a SQLite `GLOB`. This is the failure
+   [scenarios.md](../scenarios.md) explicitly names — looks like the archive
+   lost the exchange. Now a `substr` prefix comparison, which has no
+   metacharacters.
+3. **Mined commands could be dropped permanently.** The "unchanged" fast path
+   compared response *text* only, so a tool call appended after the last text
+   block was skipped — and the raw `tool_use` block is never stored, so nothing
+   could recover it. A cautious optimisation defeating the phase's governing
+   principle.
+4. A prompt record missing a `uuid` aborted the parse of the *entire file*,
+   forty lines below a handler that carefully counts and skips a malformed line.
+5. A drainer that could not take the lock gave up instead of waiting.
+6. `forget`'s confirmation was gated on **stdout** being a terminal, so piping
+   its output skipped the prompt on the one irreversible command.
+7. `init --backfill` aborted the whole import on one unreadable transcript.
+8. `doctor` printed "N transcripts never ingested" and then "capture looks
+   healthy", exit 0.
+9. `~` collapsing was a raw prefix match: `HOME=/home/dev/a` rendered
+   `/home/dev/a[1]/sub` as `~[1]/sub`.
+10. `ignore` advertised `tmem forget --in`, a Phase 2 flag that exits 2 today.
+11. `log`'s help said "oldest context first"; it is identical to `recent`.
+
+Each now has a regression test named after the failure rather than the feature.
+The pattern worth carrying forward: **the tests that mattered were the ones
+written from the promise, not from the code.** "A forgotten exchange stays
+forgotten across the next ingest" is a promise; "forget deletes the row" is an
+implementation detail, and only the second was tested.
+
 ## Verdict
 
-**Phase 1 ships, with the Exit criterion partly outstanding.** The three
+**Phase 1 ships, with the Exit criterion partly outstanding**, and only after a
+review pass that found three data-loss bugs the test suite was blind to. The three
 mechanically checkable clauses hold; the two-week soak does not exist yet and
 cannot be manufactured.
 
@@ -234,6 +278,8 @@ What was surprising, in order:
    fixed by the same line.
 4. That the watermark cannot be an offset — the plan's phrasing assumes a
    streaming parser the format does not permit.
+5. That a green test suite, clean lints and a met budget said nothing about
+   whether `forget` actually forgot anything (finding 9).
 
 ## Carried forward
 

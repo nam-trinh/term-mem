@@ -33,7 +33,9 @@ pub fn run(id: Option<String>, last: bool, yes: bool) -> Result<i32> {
         return Ok(EXIT_EMPTY);
     };
 
-    if !yes && crate::output::is_tty() {
+    // Gated on *stdin*, not stdout: `tmem forget <id> | tee log` is still a
+    // person at a keyboard, and this is the one command that cannot be undone.
+    if !yes && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         println!("about to permanently delete:");
         println!();
         println!(
