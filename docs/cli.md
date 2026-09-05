@@ -69,7 +69,7 @@ overlapping terms finds nothing:
 tmem recent                     latest exchanges
 tmem log --in <path>            everything from a directory tree
 tmem show <id>                  one exchange, in full
-tmem show <id> --session        the surrounding conversation
+tmem show <id> --session        the surrounding conversation (thread, not file)
 ```
 
 Browsing by time and place rescues a large fraction of failed searches, and it's
