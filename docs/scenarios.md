@@ -1,6 +1,13 @@
 # term-mem — Scenarios
 
-Status: design sketch. Three end-to-end walkthroughs — a conversation happens,
+Status: design sketch, with one line now checked against a build. Phase 1 claims
+no scenario — search is Phase 2 — but scenario 2's *browse backstop* is Phase 1
+surface and does run verbatim. Getting it to do so surfaced one gap:
+`--since january` needs month-name parsing, which [cli.md](cli.md) never
+specified and which no duration-suffix parser would have provided. Scenarios
+earning their keep as acceptance tests, as intended.
+
+Three end-to-end walkthroughs — a conversation happens,
 term-mem captures it, and weeks later the user gets it back. These exist to
 pressure-test the design in [mission.md](mission.md) and
 [cli.md](cli.md): if a scenario needs something the CLI doesn't have, that's a
@@ -163,7 +170,8 @@ $ tmem log --in ~/src/billing-api --since january
 ```
 
 Which is an ordinary ordered scan, not a search problem — and it puts every
-January exchange from that repo in front of him to skim.
+January exchange from that repo in front of him to skim. *(This line runs as of
+Phase 1.)*
 
 He then wants the whole thread, because the decision was arrived at across
 several turns:

@@ -52,7 +52,9 @@ write never blocks a search read.
 ```sql
 CREATE TABLE exchanges (
   id           TEXT PRIMARY KEY,     -- ULID: sorts by time, no coordination
-  session_id   TEXT NOT NULL,
+  session_id   TEXT NOT NULL,        -- transcript file identity, NOT a thread
+  thread_id    TEXT NOT NULL,        -- root uuid of the conversation tree
+  source_key   TEXT NOT NULL,        -- adapter-declared dedup key
   ts           INTEGER NOT NULL,     -- unix ms, UTC
   cwd          TEXT NOT NULL,
   repo         TEXT,                 -- resolved at capture, not derived later
@@ -69,8 +71,21 @@ CREATE VIRTUAL TABLE exchanges_fts USING fts5(
   content='exchanges', tokenize='porter unicode61'
 );
 
-CREATE TABLE commands (                -- extracted from fenced blocks
-  exchange_id TEXT, cmd TEXT, lang TEXT
+CREATE TABLE commands (                -- mined from tool_use and fenced blocks
+  exchange_id TEXT, seq INTEGER, cmd TEXT, lang TEXT
+);
+
+CREATE TABLE file_refs (               -- an Edit is a path, never a body
+  exchange_id TEXT, seq INTEGER, path TEXT, tool TEXT
+);
+
+CREATE TABLE forgotten (               -- keys of deleted exchanges, no content
+  assistant TEXT, session_id TEXT, source_key TEXT, forgotten_at INTEGER
+);
+
+CREATE TABLE watermarks (              -- one row per transcript file
+  assistant TEXT, source_path TEXT, session_id TEXT,
+  bytes INTEGER, mtime_ms INTEGER, exchanges INTEGER, updated_at INTEGER
 );
 
 CREATE VIRTUAL TABLE exchanges_vec USING vec0(
@@ -78,7 +93,32 @@ CREATE VIRTUAL TABLE exchanges_vec USING vec0(
 );
 ```
 
-Three notes on this shape:
+Phase 1 built this under `refinery`, minus the two virtual tables:
+`exchanges_fts` belongs to Phase 2 and `exchanges_vec` to Phase 5, and an index
+nothing maintains is an index that drifts from its table. `file_refs` and
+`watermarks` were added in Phase 1 — the first because this document already
+required an `Edit` to be "recorded as a path reference" without saying where,
+the second because incremental ingest needs somewhere to remember what it saw.
+
+Six notes on this shape:
+
+**`thread_id` is what `--session` groups on, not `session_id`.** Phase 0 found
+that `/clear` starts a fresh conversation tree inside the same transcript file
+under the same session id, so grouping by `session_id` merges unrelated
+conversations. `thread_id` is derived at ingest by walking to the tree root.
+See [phases/phase-0.md](phases/phase-0.md).
+
+**`source_key` is declared by the adapter, not by the schema.** It holds
+Claude Code's `uuid`; a Codex CLI row will hold a positional key. Uniqueness is
+on `(assistant, session_id, source_key)`, which is the idempotency point — a
+re-ingest upserts onto it, so a mid-turn capture completes its row rather than
+adding a second one.
+
+**The watermark is a change detector, not a seek offset.** Assembly is
+many-to-one over records written out of parent order, so no suffix of a
+transcript can be parsed on its own; `(bytes, mtime)` lets a sweep skip an
+untouched file for the price of a `stat` and forces a whole-file reparse of
+anything that moved. See [phases/phase-1.md](phases/phase-1.md) finding 5.
 
 **`repo` and `git_branch` are resolved at write time.** Deriving them from
 `cwd` at query time fails the moment a checkout is renamed or deleted, which is
@@ -94,6 +134,14 @@ at rank time.
 so the text isn't recoverable from a free page. No `deleted=1` flag on a row
 that stays greppable on disk — a tool that keeps a "deleted" secret around is
 worse than one that never stored it.
+
+**But the transcript outlives the row**, and ingest reparses whole files, so a
+delete that touches only the database is undone by the user's next turn. The
+`forgotten` table holds the adapter's dedup key for every deleted exchange and
+nothing else — no prompt, no response, no commands — which is what makes the
+delete stick without keeping the secret. This is the one place a tombstone is
+correct, and it was missed in the first Phase 1 commit: see
+[phases/phase-1.md](phases/phase-1.md) finding 9.
 
 **Encryption is opt-in and has a cost the user is told about.** SQLCipher makes
 the file useless to `grep`, `sqlite3`, and every other tool the mission promises
@@ -147,20 +195,67 @@ session runs. An `assistant` record looks like:
 
 Every column in the `exchanges` schema is already present and authoritative —
 `cwd`, `gitBranch`, `model`, `sessionId`, `timestamp`. Nothing is derived, and
-nothing is guessed. `user` records carry the prompt side, and `parentUuid`
-chains the turns, which is what `tmem show --session` walks.
+nothing is guessed.
 
 Three decisions this record shape forces:
 
-- **`text` blocks are the response. `thinking` blocks are not stored.** They are
-  the model's scratch work, they are the least reviewed text in the session, and
-  archiving them multiplies the sensitive surface for no retrieval benefit.
+- **`text` blocks are the response. `thinking` blocks are not stored.** Phase 0
+  found they arrive with `thinking: ""` and a signature — empty on disk, so
+  there is currently nothing to store. Codex CLI withholds reasoning the same
+  way (all 237 records empty), so this is a property of the category rather than
+  of one tool. The rule stays as defense-in-depth because that is
+  version-dependent behavior, but it is now guarding a less likely event.
 - **`tool_use` blocks are mined, not stored whole.** A `Bash` input is a command
   line and belongs in the `commands` table; an `Edit` input is a file diff and
-  is recorded as a path reference, not a body.
+  is recorded as a path reference, not a body. Measured: `tool_use` is 69% of
+  assistant content against 31% for prose, so this is a 3.2× reduction, not a
+  tidiness preference.
 - **`isSidechain: true` marks subagent turns.** Captured, but attributed to the
   parent exchange, so a search doesn't return five near-identical rows for one
-  question.
+  question. **Unverified** — no sidechain records appeared in the Phase 0
+  sample.
+
+### What the parser actually has to do
+
+The naive reading of the above — take `user` records as prompts, `assistant`
+records as responses — produces a badly wrong archive.
+[phases/phase-0.md](phases/phase-0.md) has the evidence; the load-bearing
+results:
+
+1. **Eleven top-level record types exist**, most without a `uuid` or `message`.
+   Filter with an allowlist so an unknown type is skipped, not fatal.
+2. **Most `user` records are not prompts.** *(Amended in Phase 1: the
+   `<command-name>` clause below rejects too much. A slash command is a request
+   the user made, and is unwrapped into its `/name args` form rather than
+   dropped; only conversation-control commands — `/clear`, `/compact`,
+   `/resume`, `/exit`, `/quit`, `/undo` — are rejected by name. See
+   [phases/phase-1.md](phases/phase-1.md) finding 2.)* In the sample, 24 of 41 were tool
+   results and several more were IDE telemetry, slash-command echoes, and one
+   14,872-character injected compaction summary. Prompts require
+   `toolUseResult == null && isMeta != true && isCompactSummary != true`, plus a
+   content-shape filter rejecting `<ide_opened_file>`, `<command-name>`, and
+   `<local-command-*>` wrappers — because those carry `origin.kind: "human"` and
+   the metadata alone will wave them through.
+3. **`message.content` is polymorphic** — a bare string or an array of blocks.
+4. **The parent chain breaks at compaction.** A `compact_boundary` record has
+   `parentUuid: null` and moves the real link to `logicalParentUuid`. Thread
+   walking must follow `parentUuid ?? logicalParentUuid` or `--session` silently
+   truncates at the boundary.
+5. **`isApiErrorMessage: true` marks a failed turn** stored in assistant shape.
+   Skip it, or the archive fills with "OAuth session expired" as a response.
+6. **Records are not written in parent order.** Children precede parents, so
+   assembly is a second pass over a buffered set rather than inline work — and
+   attribution must walk the conversation tree, not the file. Phase 1 found the
+   sharp edge: a resumed transcript can hold assistant records whose prompt was
+   never written to it, and the walk then lands them on the nearest
+   prompt-shaped ancestor, which is typically a `/clear` echo. Such records are
+   dropped and counted rather than misattributed.
+7. **Assembly is many-to-one.** Roughly six assistant records per prompt, one
+   per tool round trip, folding into a single `exchanges` row.
+
+Five of those seven fail *silently*, and Phase 1 added an eighth that does
+too — the orphaned-response trap in point 6. That is the argument for the snapshot
+fixtures below being non-negotiable rather than good practice.
 
 A background watcher (`notify` — FSEvents on macOS, inotify on Linux) tails
 registered transcript directories and parses newly appended records. This needs
@@ -201,7 +296,8 @@ parallel ingest paths that can disagree.
 
 This is a simplification worth having: it removes the double-write problem
 entirely, since both triggers converge on the same parser, keyed by
-`(session_id, uuid)`. The hook is still worth registering, because it fires on a
+`(session_id, uuid)` — Claude Code's key, not every adapter's; see the open
+question below. The hook is still worth registering, because it fires on a
 known turn boundary instead of on a partial flush, and because
 `UserPromptSubmit` is the injection point for automatic recall further down.
 
@@ -379,9 +475,13 @@ its place only as a formatting helper.
 
 ## Supporting cast
 
-- **Testing:** `insta` for snapshot tests over CLI output and transcript
-  parsers, `criterion` for the retrieval latency budget, `proptest` on the
-  redaction rules — a false negative there is a leaked credential.
+- **Testing:** unit tests beside the parser and integration tests driving the
+  real binary against a temp database. Phase 1 shipped without `insta` and
+  `criterion` — snapshots of CLI output would have locked in formatting that is
+  still moving, and the hook budget is a wall-clock measurement over 60 samples
+  rather than a benchmark harness. Both are worth revisiting when the surface
+  settles. `proptest` on the redaction rules still stands for Phase 3 — a false
+  negative there is a leaked credential.
 - **Fixtures:** recorded (and scrubbed) transcript samples per adapter, checked
   in. Adapter parsers are the most fragile code in the project and need the most
   regression pressure.
@@ -399,15 +499,44 @@ its place only as a formatting helper.
 
 - Whether the background writer is a daemon or a spawned-per-capture process. A
   daemon amortizes model loading; a spawned process has no lifecycle to manage
-  and nothing to leave running on a user's machine. Leaning spawned, with the
-  embedding backlog processed in batches.
+  and nothing to leave running on a user's machine. **Leaning spawned, and
+  Phase 1 shipped it that way** for capture; the question survives only for
+  embeddings.
 - ~~Whether transcript tailing and hook capture can coexist without
   double-writing.~~ **Resolved:** the hook is a trigger, not a source — both
   paths run the same parser against the same file, deduplicated on
   `(session_id, uuid)`.
-- Whether other assistants (aider, Codex CLI, Cursor's CLI) persist transcripts
-  in a form this complete. Claude Code's is verified; the tier-1-for-everyone
-  claim rests on the others, and each needs the same check.
+- ~~Whether other assistants (aider, Codex CLI, Cursor's CLI) persist
+  transcripts in a form this complete.~~ **Partly resolved:** Codex CLI does —
+  [phases/codex-cli-format.md](phases/codex-cli-format.md) — so tier 1 holds for
+  a second vendor. aider and Cursor's CLI still need the same check. What the
+  survey *did* unsettle is the parser interface, below.
+- **Whether the dedup key can be universal.** It can't. Codex CLI records carry
+  no `uuid` and no parent pointers, and its timestamps collide (2,186 unique
+  across 2,665 records), so its only safe key is positional —
+  `(file_path, line_number)` over an append-only file. Each adapter must declare
+  its own key rather than inheriting `(session_id, uuid)`. Blocking for
+  Phase 6, and it changes the Phase 1 interface.
+- ~~**Whether the human-prompt discriminator holds outside the VSCode
+  entrypoint.** Every Phase 0 session carried `promptSource: "sdk"`; a
+  bare-terminal session may use another value or omit the field.~~ **Resolved,
+  and without needing the bare-terminal sample:** a record with
+  `origin.kind: "human"` and no `promptSource` at all exists *inside* the
+  sampled entrypoint, so the field is optional regardless of where a session was
+  started and cannot gate ingest. The implementation reads neither
+  `promptSource` nor `origin.kind`. See
+  [phases/phase-1.md](phases/phase-1.md) finding 1.
+
+- **Where the prompts of a resumed session go.** Phase 1 found 19 assistant
+  records (16 KB) in a real transcript with no human prompt anywhere up their
+  parent chain. They are reported and dropped. If this is routine rather than an
+  artifact of one resumed session, it is a hole in the tier-1 premise and needs
+  answering before Phase 2 builds ranking on top of the archive.
+
+- **Whether the background writer needs a lifecycle at all.** Phase 1 spawns a
+  detached drainer per hook, guarded by a lock file, and it holds comfortably
+  inside the latency budget. The daemon question below stays open only for the
+  embedding path, which is the only part with a load cost to amortize.
 - Whether `sqlite-vec` is mature enough to bet the vector path on, or whether
   a flat brute-force scan over a `BLOB` column is honestly sufficient at the
   scale of one person's archive. It very likely is, up to ~100k rows.
