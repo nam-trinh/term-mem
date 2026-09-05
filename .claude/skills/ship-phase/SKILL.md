@@ -160,6 +160,21 @@ nothing needs changing:
 - **`docs/mission.md`** — rarely changes. If a phase makes one of its claims
   untrue, that is a serious finding: raise it rather than editing the mission to
   match the code.
+- **`CLAUDE.md`** — the orientation file loaded into *every* session in this
+  repo. Create it during the first phase that produces a `src/` tree if it
+  doesn't exist yet. Keep it short (~40 lines) and limited to what a fresh
+  session would otherwise re-derive or get wrong:
+  - the docs are the spec, and the order to read them in;
+  - `docs/phases/` holds empirical findings that **outrank** the design docs
+    when the two conflict;
+  - the privacy premise, because it silently constrains dependency choices;
+  - project `term-mem`, binary `tmem`;
+  - the build, test, and lint commands, and where fixtures live.
+
+  Update it whenever a phase changes any of those — most often the commands and
+  the module layout. **Do not summarize `tech-stack.md` into it.** A second copy
+  of the design will drift from the first, and the cost is paid on every
+  unrelated turn. Link, don't restate.
 
 Then write **`docs/phases/phase-<N>.md`**, following the structure of
 `phase-0.md`: sample or scope up front, honest limits on what the evidence
