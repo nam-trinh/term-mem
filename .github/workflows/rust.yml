@@ -9,14 +9,71 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# A new push supersedes the run in flight for the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build:
-
-    runs-on: ubuntu-latest
-
+  # $HOME is read directly (src/paths.rs) and nothing in src/ is cfg(windows),
+  # so the supported surface is Unix. macOS is where the project is developed;
+  # ubuntu is where it is not. Both, or neither is covered.
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      # --locked: a stale Cargo.lock is a CI failure, not a surprise later.
+      - name: Build
+        run: cargo build --locked --verbose
+      - name: Test
+        run: cargo test --locked --verbose
+
+  # The gate CLAUDE.md already documents as the build gate.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  # Cargo.toml declares rust-version = "1.82". This is what makes that true.
+  # RUSTUP_TOOLCHAIN wins over rust-toolchain.toml, which otherwise pins stable.
+  msrv:
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: 1.82.0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.82.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked --all-targets
+
+  # "Nothing leaves the machine" (CLAUDE.md) enforced against the whole
+  # dependency tree, plus RUSTSEC advisories and licenses. See deny.toml.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+
+  # tests/budget.rs asserts a 5ms p95 wall clock, which shared runners are too
+  # noisy to guarantee. Reported, never gating: a real regression shows up as a
+  # number far outside the noise, and --nocapture prints it.
+  budget:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --release --test budget -- --nocapture
