@@ -44,6 +44,14 @@ impl Env {
         dst
     }
 
+    /// Write a transcript into the fake tree. Used where a test needs paths
+    /// that exist on disk (`--repo` resolves a real `.git` at capture time).
+    pub fn write_transcript(&self, name: &str, body: &str) -> PathBuf {
+        let dst = self.projects().join("proj").join(name);
+        std::fs::write(&dst, body).unwrap();
+        dst
+    }
+
     pub fn cmd(&self) -> Command {
         let mut c = Command::cargo_bin("tmem").unwrap();
         c.env("TMEM_HOME", self.home().join("data"))
