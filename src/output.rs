@@ -2,6 +2,7 @@
 //! pipe detection, and exit codes that carry meaning.
 
 use crate::db::queries::Exchange;
+use crate::search::{Hit, HL_CLOSE, HL_OPEN};
 use std::io::IsTerminal;
 
 /// docs/cli.md: `0` found, `1` nothing found, `2` error.
@@ -175,9 +176,141 @@ pub fn print_full(ex: &Exchange) {
     }
 }
 
-pub fn print_json(rows: &[Exchange]) -> anyhow::Result<()> {
+pub fn print_json<T: serde::Serialize>(rows: &[T]) -> anyhow::Result<()> {
     for ex in rows {
         println!("{}", serde_json::to_string(ex)?);
     }
     Ok(())
+}
+
+/// Search results. The same scannable shape as `print_list`, plus the matched
+/// region — which is the whole point of a result list you can skim.
+///
+/// docs/tech-stack.md: a snippet is "expanded to a whole line or fenced block
+/// so a command is never shown truncated". A truncated command line is worse
+/// than no command line, because it looks copyable and isn't.
+pub fn print_hits(hits: &[Hit]) {
+    let tty = is_tty();
+    for (i, h) in hits.iter().enumerate() {
+        let ex = &h.exchange;
+        let matched = matched_terms(&h.snippet);
+        if tty {
+            println!(
+                "{:>2}.  {}   {}   {}",
+                i + 1,
+                bold(&ex.id),
+                fmt_date(ex.ts),
+                dim(&tilde(&ex.cwd))
+            );
+            println!("    \"{}\"", one_line(&ex.prompt, 92));
+            match ex.commands.iter().find(|c| hits_any(c, &matched)) {
+                Some(cmd) => println!("    → {}", highlight(cmd, &matched, tty)),
+                None => println!("    {}", render_snippet(&h.snippet, tty)),
+            }
+            println!();
+        } else {
+            println!(
+                "{}\t{}\t{}\t{}",
+                ex.id,
+                fmt_date(ex.ts),
+                tilde(&ex.cwd),
+                render_snippet(&h.snippet, tty)
+            );
+        }
+    }
+}
+
+/// The terms FTS5 actually matched, lifted back out of its own markers. Cheaper
+/// and more honest than re-deriving them from the query: stemming means the
+/// text that matched is often not the text that was typed.
+fn matched_terms(snippet: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = snippet;
+    while let Some(o) = rest.find(HL_OPEN) {
+        let after = &rest[o + HL_OPEN.len()..];
+        let Some(c) = after.find(HL_CLOSE) else { break };
+        let term = after[..c].to_lowercase();
+        if !term.is_empty() && !out.contains(&term) {
+            out.push(term);
+        }
+        rest = &after[c + HL_CLOSE.len()..];
+    }
+    out
+}
+
+fn hits_any(text: &str, terms: &[String]) -> bool {
+    let lower = text.to_lowercase();
+    terms.iter().any(|t| lower.contains(t.as_str()))
+}
+
+fn highlight(text: &str, terms: &[String], tty: bool) -> String {
+    let flat = one_line(text, 200);
+    if !tty {
+        return flat;
+    }
+    let lower = flat.to_lowercase();
+    let mut out = String::with_capacity(flat.len());
+    let mut i = 0;
+    while i < flat.len() {
+        let hit = terms
+            .iter()
+            .filter(|t| lower[i..].starts_with(t.as_str()))
+            .max_by_key(|t| t.len());
+        match hit {
+            Some(t) => {
+                out.push_str(&format!("\x1b[1;33m{}\x1b[0m", &flat[i..i + t.len()]));
+                i += t.len();
+            }
+            None => {
+                let ch = flat[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    out
+}
+
+/// Swap FTS5's markers for terminal escapes, or drop them on a pipe — the
+/// markers are control characters and must never reach a file.
+fn render_snippet(snippet: &str, tty: bool) -> String {
+    let flat = one_line(snippet, 200);
+    if tty {
+        flat.replace(HL_OPEN, "\x1b[1;33m")
+            .replace(HL_CLOSE, "\x1b[0m")
+    } else {
+        flat.replace(HL_OPEN, "").replace(HL_CLOSE, "")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matched_terms_come_back_out_of_the_markers() {
+        let s = format!("a {HL_OPEN}Concat{HL_CLOSE} b {HL_OPEN}ffmpeg{HL_CLOSE}");
+        assert_eq!(matched_terms(&s), vec!["concat", "ffmpeg"]);
+    }
+
+    /// The markers are U+0001 and U+0002. A pipe must receive neither them nor
+    /// an escape sequence.
+    #[test]
+    fn a_pipe_gets_no_control_characters() {
+        let s = format!("x {HL_OPEN}y{HL_CLOSE} z");
+        let out = render_snippet(&s, false);
+        assert_eq!(out, "x y z");
+        assert!(!out.contains('\x1b'));
+    }
+
+    #[test]
+    fn highlighting_is_case_insensitive_and_leaves_text_intact() {
+        let out = highlight("FFmpeg -f concat", &["ffmpeg".to_string()], true);
+        assert!(out.contains("FFmpeg"), "original case is preserved: {out}");
+        assert!(out.contains('\x1b'));
+        assert_eq!(
+            highlight("FFmpeg -f concat", &["ffmpeg".into()], false),
+            "FFmpeg -f concat"
+        );
+    }
 }

@@ -1,10 +1,15 @@
 # term-mem — Scenarios
 
-Status: design sketch, with one line now checked against a build. Phase 1 claims
-no scenario — search is Phase 2 — but scenario 2's *browse backstop* is Phase 1
-surface and does run verbatim. Getting it to do so surfaced one gap:
-`--since january` needs month-name parsing, which [cli.md](cli.md) never
-specified and which no duration-suffix parser would have provided. Scenarios
+Status: scenarios 1 and 2 are Phase 2's acceptance tests and now run as
+integration tests against the real binary (`tests/search.rs`). **Scenario 1 runs
+verbatim, ranking included. Scenario 2 runs verbatim except for one sentence,
+corrected in place below.** Scenario 3's deletion half runs; its redaction half
+is Phase 3.
+
+Two gaps surfaced from being executed rather than read: `--since january` needs
+month-name parsing, which [cli.md](cli.md) never specified and which no
+duration-suffix parser would have provided (Phase 1), and scenario 2's ranking
+claim turns out to be an intuition nothing had checked (Phase 2). Scenarios
 earning their keep as acceptance tests, as intended.
 
 Three end-to-end walkthroughs — a conversation happens,
@@ -106,7 +111,10 @@ browser. This is the 95% case, and it's deliberately the boring one.
 
 **What this scenario tests:** that plain keyword search over a well-tokenized
 index carries the common path, with no embeddings involved. If this case needs
-semantic search, the index is wrong.
+semantic search, the index is wrong. *(It does not: this scenario runs verbatim
+as of Phase 2, ranking included. Note that the ordering depends on the second
+result's response genuinely being 200 lines — BM25 normalises by length, so the
+detail this scenario mentions in passing is what puts the March exchange first.)*
 
 ---
 
@@ -161,7 +169,20 @@ $ tmem backfill --repo --since january
 ```
 
 `--repo` resolves from the current checkout and collapses the space to
-`billing-api`; `--since` cuts it further. Two results. The first is the one.
+`billing-api`; `--since` cuts it further. Two results.
+
+~~The first is the one.~~ **Corrected in Phase 2: it is the second.** Both
+results contain `backfill` exactly once, in the prompt, so nothing separates
+them but BM25's length normalisation — which prefers the short follow-up ("how
+long will the backfill take on staging") over the long reasoning this scenario
+exists to recall. No column weighting reaches it, because the match is in the
+same column for both. See [phases/phase-2.md](phases/phase-2.md) finding 2.
+
+That the sentence was wrong matters less than what it was doing there: it
+described what a search engine *feels* like rather than anything that had been
+measured, in a document used as an acceptance test. The rest of the scenario is
+unaffected, and is the part it says it is testing — eleven results became two,
+and two is a set Marcus reads in full.
 
 If even that had failed, the browse path is the backstop:
 
@@ -271,7 +292,10 @@ Read together, three things the current design should decide:
 
 1. **Extracted commands deserve their own index and their own weight.** All
    three scenarios lean on it, and it's the difference between ranking the right
-   exchange first and ranking it seventh.
+   exchange first and ranking it seventh. *(Shipped in Phase 2 at `8 / 2 / 1`
+   against prompt and response. It is a column weight, so it separates a
+   command match from a prose match and nothing else — scenario 2's two results
+   both match in `prompt`, and the weighting has no opinion about them.)*
 2. **`--in` should default to global.** Scenario 2 breaks under an implicit
    `--in .`, and it breaks silently, which is the worst way to break.
 3. **Redaction-on-capture is load-bearing, not a refinement.** Scenario 3's

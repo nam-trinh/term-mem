@@ -10,6 +10,7 @@ pub mod queue;
 use adapters::{Adapter, ParseReport, ParsedExchange};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -102,6 +103,11 @@ pub fn ingest_file(
     stats.absorb(report);
 
     let mut session_id = None;
+    // One `cwd` per transcript is the norm, and resolving a repo means walking
+    // to the filesystem root looking for `.git`. Doing that per exchange is
+    // hundreds of stat calls for one answer — and on a path that does not exist
+    // locally it can block for milliseconds each time.
+    let mut repos: HashMap<String, Option<String>> = HashMap::new();
     let tx = conn.transaction()?;
     for ex in &exchanges {
         if is_ignored(Path::new(&ex.cwd), ignores) {
@@ -109,7 +115,11 @@ pub fn ingest_file(
             continue;
         }
         session_id.get_or_insert_with(|| ex.session_id.clone());
-        match write_exchange(&tx, adapter.name(), ex)? {
+        let repo = repos
+            .entry(ex.cwd.clone())
+            .or_insert_with(|| resolve_repo(Path::new(&ex.cwd)))
+            .clone();
+        match write_exchange(&tx, adapter.name(), ex, repo)? {
             Written::Inserted => stats.inserted += 1,
             Written::Updated => stats.updated += 1,
             Written::Unchanged => {}
@@ -152,6 +162,7 @@ fn write_exchange(
     tx: &rusqlite::Transaction,
     assistant: &str,
     ex: &ParsedExchange,
+    repo: Option<String>,
 ) -> Result<Written> {
     // The transcript outlives the row, so a forgotten exchange would otherwise
     // come straight back on the next ingest of the same file.
@@ -180,8 +191,6 @@ fn write_exchange(
         )
         .optional()?;
 
-    let repo = resolve_repo(Path::new(&ex.cwd));
-
     if let Some((id, prev_response, n_cmds, n_files)) = existing {
         if prev_response == ex.response
             && n_cmds == ex.commands.len() as i64
@@ -191,7 +200,7 @@ fn write_exchange(
         }
         tx.execute(
             "UPDATE exchanges SET ts = ?2, cwd = ?3, repo = ?4, git_branch = ?5, model = ?6, \
-             prompt = ?7, response = ?8, thread_id = ?9 WHERE id = ?1",
+             prompt = ?7, response = ?8, thread_id = ?9, commands_text = ?10 WHERE id = ?1",
             params![
                 &id,
                 ex.ts_ms,
@@ -201,7 +210,8 @@ fn write_exchange(
                 &ex.model,
                 &ex.prompt,
                 &ex.response,
-                &ex.thread_id
+                &ex.thread_id,
+                commands_text(ex)
             ],
         )?;
         tx.execute("DELETE FROM commands  WHERE exchange_id = ?1", params![&id])?;
@@ -213,8 +223,8 @@ fn write_exchange(
     let id = ulid::Ulid::from_parts(ex.ts_ms.max(0) as u64, rand_u128()).to_string();
     tx.execute(
         "INSERT INTO exchanges (id, assistant, session_id, thread_id, source_key, ts, cwd, \
-         repo, git_branch, model, prompt, response, redacted) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,0)",
+         repo, git_branch, model, prompt, response, commands_text, redacted) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,0)",
         params![
             &id,
             assistant,
@@ -227,11 +237,23 @@ fn write_exchange(
             &ex.git_branch,
             &ex.model,
             &ex.prompt,
-            &ex.response
+            &ex.response,
+            commands_text(ex)
         ],
     )?;
     write_derived(tx, &id, ex)?;
     Ok(Written::Inserted)
+}
+
+/// The mined command lines, denormalised onto the row so the FTS5 index can be
+/// external-content over `exchanges`. The `commands` table stays authoritative;
+/// this is a projection of it maintained in the same transaction.
+fn commands_text(ex: &ParsedExchange) -> String {
+    ex.commands
+        .iter()
+        .map(|c| c.cmd.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn write_derived(tx: &rusqlite::Transaction, id: &str, ex: &ParsedExchange) -> Result<()> {

@@ -3,6 +3,7 @@ pub mod forget;
 pub mod ignore;
 pub mod init;
 pub mod pause;
+pub mod search;
 pub mod show;
 pub mod status;
 pub mod timespec;
@@ -33,14 +34,28 @@ pub struct BrowseArgs {
     pub json: bool,
 }
 
+/// Both spellings of a `--in` path: as typed, and as the filesystem resolves
+/// it. They differ wherever a symlink is involved — `/tmp` and `/var` on macOS
+/// are the everyday case — and the archive holds whichever one the assistant
+/// happened to record.
+pub fn in_path_candidates(p: &std::path::Path) -> Vec<String> {
+    let mut out = vec![p.to_string_lossy().into_owned()];
+    if let Ok(real) = std::fs::canonicalize(p) {
+        let real = real.to_string_lossy().into_owned();
+        if !out.contains(&real) {
+            out.push(real);
+        }
+    }
+    out
+}
+
 impl BrowseArgs {
     pub fn to_filter(&self) -> Result<Filter> {
-        let in_path = self.in_path.as_ref().map(|p| {
-            std::fs::canonicalize(p)
-                .unwrap_or_else(|_| p.clone())
-                .to_string_lossy()
-                .into_owned()
-        });
+        let in_paths = self
+            .in_path
+            .as_ref()
+            .map(|p| in_path_candidates(p))
+            .unwrap_or_default();
         let repo = if self.repo {
             let cwd = std::env::current_dir()?;
             match crate::capture::resolve_repo(&cwd) {
@@ -51,7 +66,7 @@ impl BrowseArgs {
             None
         };
         Ok(Filter {
-            in_path,
+            in_paths,
             since_ms: self.since.as_deref().map(timespec::parse).transpose()?,
             repo,
             limit: Some(self.limit),

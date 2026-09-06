@@ -1,6 +1,6 @@
 //! term-mem — a local memory layer for terminal AI conversations.
 //!
-//! Phase 1: capture and browse. Search arrives in Phase 2 — see docs/plan.md.
+//! Phase 2: capture, browse, and keyword recall. See docs/plan.md.
 //!
 //! There is no network code in this binary, by design and by promise. See
 //! docs/mission.md: nothing leaves the machine.
@@ -10,6 +10,7 @@ mod cli;
 mod db;
 mod output;
 mod paths;
+mod search;
 
 use clap::{Parser, Subcommand};
 use output::{EXIT_ERROR, EXIT_OK};
@@ -26,9 +27,15 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// Search terms. Search is the default verb — but it lands in Phase 2.
-    #[arg(trailing_var_arg = true, hide = true)]
+    /// Search terms. Anything that is not a recognized subcommand is a query.
+    ///
+    /// Deliberately *not* `trailing_var_arg`: docs/scenarios.md types
+    /// `tmem backfill --repo --since january`, with the flags after the query,
+    /// and a trailing-var-arg would swallow them into the search terms.
     query: Vec<String>,
+
+    #[command(flatten)]
+    browse: cli::BrowseArgs,
 }
 
 #[derive(Subcommand)]
@@ -63,6 +70,12 @@ enum Command {
         /// Say nothing on success
         #[arg(long)]
         quiet: bool,
+    },
+    /// Search the archive — the explicit form of the default verb
+    Search {
+        query: Vec<String>,
+        #[command(flatten)]
+        browse: cli::BrowseArgs,
     },
     /// Latest exchanges
     Recent {
@@ -107,6 +120,12 @@ enum Command {
         /// The most recent exchange
         #[arg(long)]
         last: bool,
+        /// Everything since a point in time, e.g. `1 hour ago`
+        #[arg(long, value_name = "WHEN")]
+        since: Option<String>,
+        /// Everything recorded under a directory tree
+        #[arg(long = "in", value_name = "PATH")]
+        in_path: Option<PathBuf>,
         /// Do not ask
         #[arg(long, short = 'y')]
         yes: bool,
@@ -128,15 +147,10 @@ fn run() -> anyhow::Result<i32> {
     let cli = Cli::parse();
 
     let Some(command) = cli.command else {
+        // docs/cli.md: search is the default verb, because it is ~95% of
+        // invocations and this tool has a dominant one.
         if !cli.query.is_empty() {
-            // docs/cli.md makes search the default verb. Phase 2 implements it;
-            // until then say so plainly rather than printing an empty result,
-            // which would look like the archive had lost the exchange.
-            eprintln!(
-                "tmem: search lands in Phase 2. For now, browse what was captured:\n  \
-                 tmem recent\n  tmem log --in <path>\n  tmem show <id>"
-            );
-            return Ok(EXIT_ERROR);
+            return cli::search::run(&cli.query, &cli.browse);
         }
         return cli::status::status();
     };
@@ -152,13 +166,20 @@ fn run() -> anyhow::Result<i32> {
             all,
             quiet,
         } => cli::capture_cmd::run(hook, drain, path, all, quiet),
+        Command::Search { query, browse } => cli::search::run(&query, &browse),
         Command::Recent { browse } => cli::show::list(&browse),
         Command::Log { browse } => cli::show::list(&browse),
         Command::Show { id, session, json } => cli::show::show(&id, session, json),
         Command::Pause { duration } => cli::pause::pause(duration.as_deref()),
         Command::Resume => cli::pause::resume(),
         Command::Ignore { path, list, remove } => cli::ignore::run(path, list, remove),
-        Command::Forget { id, last, yes } => cli::forget::run(id, last, yes),
+        Command::Forget {
+            id,
+            last,
+            since,
+            in_path,
+            yes,
+        } => cli::forget::run(id, last, since, in_path, yes),
     }
     .map(|c| if c == EXIT_OK { EXIT_OK } else { c })
 }

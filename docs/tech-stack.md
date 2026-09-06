@@ -67,8 +67,8 @@ CREATE TABLE exchanges (
 );
 
 CREATE VIRTUAL TABLE exchanges_fts USING fts5(
-  prompt, response, commands,
-  content='exchanges', tokenize='porter unicode61'
+  prompt, response, commands_text,     -- a column of `exchanges`, see below
+  content='exchanges', content_rowid='rowid', tokenize='porter unicode61'
 );
 
 CREATE TABLE commands (                -- mined from tool_use and fenced blocks
@@ -99,6 +99,20 @@ nothing maintains is an index that drifts from its table. `file_refs` and
 `watermarks` were added in Phase 1 — the first because this document already
 required an `Edit` to be "recorded as a path reference" without saying where,
 the second because incremental ingest needs somewhere to remember what it saw.
+
+Phase 2 added `exchanges_fts` and, with it, one column this document did not
+have. **The `commands` column above could not be created as written**: with
+`content='exchanges'`, every indexed column is a lookup into that row, and
+`commands` is a table. The alternatives were a standalone index holding a second
+copy of every prompt and response, or a contentless one that cannot produce
+`snippet()`. So `exchanges` gained **`commands_text`** — the mined command lines
+joined onto the row, written in the same transaction as the `commands` rows,
+which stay authoritative. See [phases/phase-2.md](phases/phase-2.md) finding 4.
+
+**The index is maintained by triggers on `exchanges`, not by the write path.**
+That is what makes "maintained transactionally" true against a write path that
+does not exist yet, and it is why deleting a row already deletes its index
+entries.
 
 Six notes on this shape:
 
@@ -212,8 +226,14 @@ Three decisions this record shape forces:
   tidiness preference.
 - **`isSidechain: true` marks subagent turns.** Captured, but attributed to the
   parent exchange, so a search doesn't return five near-identical rows for one
-  question. **Unverified** — no sidechain records appeared in the Phase 0
-  sample.
+  question. ~~**Unverified** — no sidechain records appeared in the Phase 0
+  sample.~~ **Corrected in Phase 2: they appear in a different file.** Subagent
+  turns are written to `<project>/<session>/subagents/agent-*.jsonl`, which the
+  transcript walk does not descend into, so they are currently not captured at
+  all — neither as rows nor folded into a parent. Their root record is a `user`
+  record with `isMeta: true` carrying the agent's instructions, so the inline
+  shape this bullet describes may not be one that occurs. Phase 6 owns it; see
+  [phases/phase-2.md](phases/phase-2.md) finding 3.
 
 ### What the parser actually has to do
 
@@ -229,7 +249,14 @@ results:
    the user made, and is unwrapped into its `/name args` form rather than
    dropped; only conversation-control commands — `/clear`, `/compact`,
    `/resume`, `/exit`, `/quit`, `/undo` — are rejected by name. See
-   [phases/phase-1.md](phases/phase-1.md) finding 2.)* In the sample, 24 of 41 were tool
+   [phases/phase-1.md](phases/phase-1.md) finding 2.)* **Amended again in
+   Phase 2, and this is the load-bearing correction: the content-shape filter
+   *strips* injected blocks, it does not reject the records containing them. The
+   editor prepends `<ide_opened_file>` to the record that carries the prompt, so
+   "starts with an injected tag" and "is injected content" are different
+   questions, and Phase 1 answered the second by asking the first. Only a record
+   with nothing left after stripping is not a prompt. See
+   [phases/phase-2.md](phases/phase-2.md) finding 1.** In the sample, 24 of 41 were tool
    results and several more were IDE telemetry, slash-command echoes, and one
    14,872-character injected compaction summary. Prompts require
    `toolUseResult == null && isMeta != true && isCompactSummary != true`, plus a
@@ -364,9 +391,13 @@ search.
 
 Two retrievers run over the filtered set:
 
-- **BM25 over FTS5**, with column weights — `commands` ≫ `prompt` > `response`.
-  Query terms are stemmed and OR-ed, which is what lets `tmem <query>` accept
-  bare multi-word input with no quoting.
+- **BM25 over FTS5**, with column weights — `commands` ≫ `prompt` > `response`,
+  shipped as `8 / 2 / 1`. Query terms are stemmed and OR-ed, which is what lets
+  `tmem <query>` accept bare multi-word input with no quoting; each term is
+  passed as a quoted FTS5 string, so nothing a user types can become syntax.
+  **What column weights cannot do is separate two rows that match in the same
+  column**, where BM25's length normalisation decides — and prefers the shorter
+  row. That is finding 2 of Phase 2 and it contradicts scenario 2.
 - **Vector kNN over `sqlite-vec`**, when embeddings are enabled, for the case
   where the user's words don't overlap the archive's at all ("that thing about
   making the migration not lock the table").
@@ -384,6 +415,8 @@ lines; a result list of full responses is unusable.
 
 **Budget: p95 under 100ms** for a cold `tmem <query>` on a 100k-exchange
 archive. Above that, people stop reaching for it and the archive dies.
+**Measured in Phase 2 against a generated 100k-exchange archive** —
+[phases/phase-2.md](phases/phase-2.md) finding 5.
 
 ### Embeddings, and how not to require them
 
@@ -527,11 +560,14 @@ its place only as a formatting helper.
   `promptSource` nor `origin.kind`. See
   [phases/phase-1.md](phases/phase-1.md) finding 1.
 
-- **Where the prompts of a resumed session go.** Phase 1 found 19 assistant
+- ~~**Where the prompts of a resumed session go.** Phase 1 found 19 assistant
   records (16 KB) in a real transcript with no human prompt anywhere up their
-  parent chain. They are reported and dropped. If this is routine rather than an
-  artifact of one resumed session, it is a hole in the tier-1 premise and needs
-  answering before Phase 2 builds ranking on top of the archive.
+  parent chain.~~ **Resolved, and the premise is intact: they never went
+  anywhere.** The prompts are in the transcript, in the same record as the
+  editor telemetry that Phase 1's discriminator rejected wholesale. Stripping
+  injected blocks instead of rejecting the record takes this archive's orphan
+  count from 21 records (19,192 chars) to zero and its exchange count from 24 to
+  34. See [phases/phase-2.md](phases/phase-2.md) finding 1.
 
 - **Whether the background writer needs a lifecycle at all.** Phase 1 spawns a
   detached drainer per hook, guarded by a lock file, and it holds comfortably

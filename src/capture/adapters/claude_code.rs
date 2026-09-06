@@ -170,13 +170,21 @@ impl ClaudeCode {
             }
             return Some(cmd);
         }
-        if starts_with_injected_tag(&text, self.injected_block_tags()) {
-            return None;
+        // Injected blocks are *stripped*, not grounds for rejection. Phase 1
+        // rejected any record that opened with one, and Phase 2 found that this
+        // loses real questions: the editor prepends `<ide_opened_file>` to the
+        // very record that carries the prompt, as a separate text block, so
+        // "does this record start with telemetry" and "is this record telemetry"
+        // are different questions. See docs/phases/phase-2.md finding 1.
+        let stripped = strip_injected_blocks(&text, self.injected_block_tags());
+        let stripped = stripped.trim();
+        if stripped.is_empty() {
+            return None; // the record was nothing but injected content
         }
         // Note what is *not* consulted: `promptSource` and `origin.kind`. Both
         // are optional in practice (see above), so neither can gate ingest, and
         // a positive signal that cannot gate is not worth reading.
-        Some(text)
+        Some(stripped.to_string())
     }
 
     fn is_human_prompt(&self, r: &Record) -> bool {
@@ -211,17 +219,41 @@ fn tag_body<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
     Some(&text[start..end])
 }
 
-fn starts_with_injected_tag(text: &str, tags: &[&str]) -> bool {
-    let t = text.trim_start();
-    let Some(rest) = t.strip_prefix('<') else {
-        return false;
-    };
-    let end = match rest.find(['>', ' ', '\n']) {
-        Some(i) => i,
-        None => return false,
-    };
-    let tag = &rest[..end];
-    tags.contains(&tag)
+/// Remove every injected `<tag>…</tag>` span, keeping whatever the user typed
+/// around it.
+///
+/// The Phase 1 rule tested only the *first* tag and rejected the whole record,
+/// which is right for a record that is pure telemetry and wrong for the common
+/// one that is telemetry followed by a question. Only a properly closed block
+/// is removed — see the unclosed case below.
+fn strip_injected_blocks(text: &str, tags: &[&str]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        let Some(lt) = rest.find('<') else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..lt]);
+        let after = &rest[lt + 1..];
+        if let Some(end) = after.find(['>', ' ', '\n', '\t']) {
+            let tag = &after[..end];
+            if tags.contains(&tag) {
+                let close = format!("</{tag}>");
+                if let Some(c) = after.find(&close) {
+                    rest = &after[c + close.len()..];
+                    continue;
+                }
+                // Unclosed. Treat it as ordinary text rather than swallowing
+                // the remainder: "why does <ide_opened_file> appear here?" is a
+                // question someone asked, and capture is the irreversible half.
+                // A stray tag in a prompt is cosmetic; a truncated prompt is not.
+            }
+        }
+        out.push('<');
+        rest = after;
+    }
+    out
 }
 
 impl Adapter for ClaudeCode {
@@ -690,6 +722,68 @@ mod tests {
         );
     }
 
+    /// The Phase 2 finding, and the reason 19 KB of real answers were missing
+    /// from a four-day archive: the editor prepends `<ide_opened_file>` to the
+    /// record that carries the prompt, so Phase 1's "starts with an injected
+    /// tag" rule rejected the question and orphaned its response.
+    ///
+    /// Written from the promise ("a question the user asked is captured"),
+    /// which is the lesson of phase-1.md finding 9.
+    #[test]
+    fn a_prompt_behind_editor_telemetry_is_still_a_prompt() {
+        let (ex, report) = parse("finding-p2-injected-prefix.jsonl");
+        assert_eq!(
+            report.orphaned_records, 0,
+            "no response should be left unattributable: {report:?}"
+        );
+        assert_eq!(ex.len(), 2);
+        assert_eq!(
+            ex[0].prompt,
+            "I have 4 mp4 files I need to join into one. Same codec, same resolution. \
+             Don't want to re-encode."
+        );
+        assert!(!ex[0].prompt.contains("ide_opened_file"));
+        // A trailing injected block goes the same way as a leading one.
+        assert_eq!(ex[1].prompt, "why -safe 0?");
+    }
+
+    /// The other half of the rule: a record that is *nothing but* injected
+    /// content is still not a prompt. Phase 1 got this half right and it must
+    /// not regress — `<ide_opened_file>` alone opens no exchange.
+    #[test]
+    fn a_record_that_is_only_telemetry_is_still_rejected() {
+        let (ex, _) = parse("finding-p2-injected-prefix.jsonl");
+        assert!(
+            !ex.iter().any(|e| e.prompt.contains("files.txt in the IDE")),
+            "a pure-telemetry record must not become an exchange"
+        );
+    }
+
+    #[test]
+    fn stripping_leaves_surrounding_text_and_unknown_tags_alone() {
+        let tags = ["ide_opened_file", "system-reminder"];
+        assert_eq!(
+            strip_injected_blocks("<ide_opened_file>x</ide_opened_file>real question", &tags),
+            "real question"
+        );
+        assert_eq!(
+            strip_injected_blocks("before <system-reminder>x</system-reminder> after", &tags),
+            "before  after"
+        );
+        // A tag we do not know is ordinary text: a user asking about `<div>`
+        // must get their question back intact.
+        assert_eq!(
+            strip_injected_blocks("why does <div> not center?", &tags),
+            "why does <div> not center?"
+        );
+        // An unclosed injected block is left alone rather than swallowing the
+        // rest of the prompt.
+        assert_eq!(
+            strip_injected_blocks("keep <system-reminder>then this", &tags),
+            "keep <system-reminder>then this"
+        );
+    }
+
     /// Phase 0 counted slash-command records with the editor telemetry. They
     /// are not the same thing: `/ship-phase` is a request the user made, and
     /// dropping it loses the exchange. See docs/phases/phase-1.md finding 2.
@@ -741,25 +835,27 @@ mod tests {
         assert_eq!(slash_command("just a sentence"), None);
     }
 
+    /// Kept from Phase 1, where the same cases guarded the anchored *rejection*
+    /// rule. The rule became a strip in Phase 2; what must not change is that a
+    /// prompt merely mentioning a tag survives intact.
     #[test]
-    fn injected_tag_matching_is_anchored() {
-        // A prompt that merely mentions a tag is not injected content.
-        assert!(starts_with_injected_tag(
-            "<ide_opened_file>x",
-            INJECTED_TAGS
-        ));
-        assert!(starts_with_injected_tag(
-            "  <command-name>/clear</command-name>",
-            INJECTED_TAGS
-        ));
-        assert!(!starts_with_injected_tag(
-            "why does <ide_opened_file> appear here?",
-            INJECTED_TAGS
-        ));
-        assert!(!starts_with_injected_tag(
-            "<div> is not one of ours",
-            INJECTED_TAGS
-        ));
+    fn injected_tag_matching_does_not_eat_prompts_that_mention_a_tag() {
+        assert_eq!(
+            strip_injected_blocks("<ide_opened_file>x</ide_opened_file>", INJECTED_TAGS),
+            ""
+        );
+        assert_eq!(
+            strip_injected_blocks("  <command-name>/clear</command-name>", INJECTED_TAGS),
+            "  "
+        );
+        assert_eq!(
+            strip_injected_blocks("why does <ide_opened_file> appear here?", INJECTED_TAGS),
+            "why does <ide_opened_file> appear here?"
+        );
+        assert_eq!(
+            strip_injected_blocks("<div> is not one of ours", INJECTED_TAGS),
+            "<div> is not one of ours"
+        );
     }
 
     // ── Phase 0 finding 3 ────────────────────────────────────────────────
