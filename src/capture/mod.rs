@@ -176,25 +176,38 @@ fn write_exchange(
         return Ok(Written::Forgotten);
     }
 
-    // The derived counts come back with the row: an exchange whose response text
-    // is unchanged can still have gained a tool call, and skipping the re-derive
-    // on text alone would drop it permanently — the raw `tool_use` block is
-    // never stored, so nothing can recover it later.
-    let existing: Option<(String, String, i64, i64)> = tx
+    // Everything the row stores comes back, and everything is compared. The
+    // temptation here is to compare something cheap and skip the rewrite, and
+    // it has now been wrong twice:
+    //
+    //   * Phase 1 compared response text alone, so an exchange that gained a
+    //     tool call kept neither the command nor a way to recover it.
+    //   * Phase 2 compared response text plus derived *counts*, which misses a
+    //     changed prompt entirely — and Phase 2 is the release that changed how
+    //     prompts are extracted, so every row written by a Phase 1 binary would
+    //     have kept its unstripped prompt forever.
+    //
+    // The parse already happened; the row is already in hand. Comparing all of
+    // it costs nothing worth having.
+    let existing: Option<(String, String, String, String)> = tx
         .query_row(
-            "SELECT id, response, \
-               (SELECT COUNT(*) FROM commands  WHERE exchange_id = exchanges.id), \
-               (SELECT COUNT(*) FROM file_refs WHERE exchange_id = exchanges.id) \
+            "SELECT id, prompt, response, commands_text \
              FROM exchanges WHERE assistant = ?1 AND session_id = ?2 AND source_key = ?3",
             params![assistant, &ex.session_id, &ex.source_key],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?;
 
-    if let Some((id, prev_response, n_cmds, n_files)) = existing {
-        if prev_response == ex.response
-            && n_cmds == ex.commands.len() as i64
-            && n_files == ex.files.len() as i64
+    if let Some((id, prev_prompt, prev_response, prev_commands)) = existing {
+        let prev_files: Vec<String> = tx
+            .prepare_cached("SELECT path FROM file_refs WHERE exchange_id = ?1 ORDER BY seq")?
+            .query_map(params![&id], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        if prev_prompt == ex.prompt
+            && prev_response == ex.response
+            && prev_commands == commands_text(ex)
+            && prev_files.len() == ex.files.len()
+            && prev_files.iter().zip(&ex.files).all(|(p, f)| *p == f.path)
         {
             return Ok(Written::Unchanged);
         }

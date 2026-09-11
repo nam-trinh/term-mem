@@ -21,14 +21,31 @@ const W_COMMANDS: f64 = 8.0;
 
 /// Sentinels wrapped around the matched region by FTS5, swapped for terminal
 /// escapes (or removed) once we know whether stdout is a terminal.
-pub const HL_OPEN: &str = "\u{1}";
-pub const HL_CLOSE: &str = "\u{2}";
+///
+/// They are control characters and must never reach a consumer — not a file,
+/// not a pipe, and not `--json`, which scenario 3 feeds straight to another
+/// assistant.
+pub const HL_OPEN: char = '\u{1}';
+pub const HL_CLOSE: char = '\u{2}';
+
+/// Strip the sentinels for serialisation. They are an internal detail of how
+/// the terminal renderer finds the matched region; a JSON consumer asked for
+/// text.
+fn plain<S: serde::Serializer>(s: &str, ser: S) -> Result<S::Ok, S::Error> {
+    ser.serialize_str(&strip_markers(s))
+}
+
+pub fn strip_markers(s: &str) -> String {
+    s.replace([HL_OPEN, HL_CLOSE], "")
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Hit {
     #[serde(flatten)]
     pub exchange: Exchange,
     /// The matched region, with the match delimited by [`HL_OPEN`]/[`HL_CLOSE`].
+    /// Serialised without them.
+    #[serde(serialize_with = "plain")]
     pub snippet: String,
     /// BM25, negated so that larger is better — the raw value is negative and
     /// sorts the other way, which is a trap in a `--json` consumer.

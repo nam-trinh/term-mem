@@ -32,7 +32,7 @@ The Exit criterion has two clauses and they came out differently:
 | --- | --- |
 | scenario 1 runs verbatim | **yes** — every command, and the documented ranking |
 | scenario 2 runs verbatim | **partly** — the commands and the result counts hold; "the first is the one" does not. Finding 2 |
-| p95 under 100 ms at 100k exchanges | **yes** — worst case 28.12 ms, finding 5 |
+| p95 under 100 ms at 100k exchanges | **yes** — worst case 17.87 ms, finding 5 |
 
 ## 1. The prompts of a "resumed session" were never missing
 
@@ -175,24 +175,28 @@ the file after a delete already passes for the bulk selectors added here.
 ## 5. Budget: measured
 
 ```
-100,000 exchanges, 139.5 MB, built by ingesting 200 generated transcripts (14 s)
+100,000 exchanges, 139.6 MB, built by ingesting 200 generated transcripts (12 s)
 
-  common two-term  p50 21.53 ms   p95 28.12 ms   max 44.01 ms
-  rare term        p50  3.26 ms   p95  3.62 ms   max  3.71 ms
-  filtered         p50 17.12 ms   p95 24.55 ms   max 26.79 ms
+  common two-term  p50 17.09 ms   p95 17.87 ms   max 28.36 ms
+  rare term        p50  2.96 ms   p95  3.07 ms   max  3.07 ms
+  filtered         p50 12.38 ms   p95 15.41 ms   max 21.38 ms
 ```
 
-Under the 100 ms budget by 3.5×. Cold-process measurement, which is what a user
+Under the 100 ms budget by 5×, measured against the code as shipped — an
+earlier run of the same test on the pre-review code gave a worst p95 of 28.12 ms,
+so run-to-run variance on a laptop is a larger effect here than anything in the
+diff, and neither number is near the budget. Cold-process measurement, which is what a user
 pays: fork, open the database, run the migration check, plan, match, rank,
 snippet, print. The archive is built by ingesting generated transcripts through
 the real parser rather than by inserting rows behind it, because the index is
 maintained on the write path and a fixture that bypassed it would be measuring a
 different program.
 
-The hook budget is unaffected and still holds: p95 **2.77 ms** on a small
-transcript and **3.68 ms** on an 8 MB one, against 5 ms. The 8 MB figure has a
-32 ms outlier in `max` that the p95 does not see; it is not new to this phase,
-but it is the first time it has appeared in a run recorded here.
+The hook budget is unaffected and still holds: p95 **2.92 ms** on a small
+transcript and **2.14 ms** on an 8 MB one, against 5 ms — still flat in the size
+of the transcript the hook points at, which is the property that matters. One
+earlier run showed a 32 ms outlier in `max` on the 8 MB case that the p95 does
+not see; it did not reproduce, and it is recorded here rather than dropped.
 
 **A footnote that was nearly a wasted afternoon.** The first version of this
 measurement took an estimated fifty minutes to build its archive, at 0% CPU.
@@ -220,9 +224,64 @@ Both bugs are the same shape — a path transformed on one side of a comparison
 and not the other — and the fix is now to match *any* spelling of the tree
 rather than to pick the right one.
 
+## 7. A review found four more, and one of them was the phase's own headline
+
+Phase 1 ended with the observation that "the tests that mattered were the ones
+written from the promise, not from the code". Phase 2 shipped 91 passing tests,
+clean lints and a met budget, and a review of the PR found four defects. The
+list is shorter than Phase 1's eleven, and one entry is worse than any of them.
+
+1. **The injected-block fix did not apply to any archive that already existed.**
+   Ingest's "unchanged" fast path compared the response text and the *counts* of
+   derived rows — never the prompt. Finding 1 is a change to how prompts are
+   extracted, so every row written by a Phase 1 binary would have kept its
+   unstripped prompt through every subsequent re-ingest, forever. The headline
+   fix of the phase reached only exchanges captured after it, and the phase's
+   own test suite re-ingested nothing that predated the change.
+
+   This is [phase-1.md](phase-1.md) finding 9's third defect exactly — "a
+   cautious optimisation defeating the phase's governing principle" — one field
+   over, in a comparison whose comment explains why the *previous* version of
+   the same mistake was wrong. The fix compares everything the row stores. The
+   parse has already happened and the row is already in hand; comparing all of
+   it costs nothing worth having.
+
+2. **`highlight()` aborted the process on non-ASCII.** It searched a lowercased
+   copy of the line using byte offsets from the original, which desynchronise
+   the moment a character's lowercase form differs in byte length — `İ`
+   (U+0130) lowercases to two chars. A captured command containing one made
+   `tmem <query>` panic with exit **101**, which is not one of the three exit
+   codes [cli.md](../cli.md) promises for `tmem <query> || …`. Terminal path
+   only, which is why nothing in a suite that captures stdout saw it.
+
+3. **Truncation cut between an opening highlight marker and its close**, leaving
+   `\x1b[1;33m` unmatched and the user's terminal bold yellow after the process
+   exited. Rendering now counts visible characters and closes what it opened in
+   the same pass.
+
+4. **`--json` leaked the raw FTS5 sentinels** (`\u0001`, `\u0002`) into the
+   snippet — into the pipe scenario 3 feeds to another assistant. The test
+   written to prevent exactly this asserted `!stdout.contains('\u{1}')` on the
+   raw output, and `serde_json` had already escaped the control character to six
+   printable ones, so the assertion sailed over the bug it existed to catch.
+
+The pattern worth carrying forward is narrower than Phase 1's and sharper: **two
+of these four are tests that ran the right scenario through the wrong surface.**
+The JSON test checked the bytes before decoding; the whole suite drives the
+binary through a pipe, so no test has ever executed the branch that formats for
+a terminal. A test that cannot reach the code it is named after is worse than no
+test, because it is counted.
+
+Each fix now has a regression test named after the failure, and each was
+confirmed to fail against the unfixed code before being kept — including the
+truncation sweep, whose first version padded past the cut and passed against the
+bug.
+
 ## Verdict
 
-**Phase 2 ships.** Scope is complete as written: `exchanges_fts` maintained
+**Phase 2 ships, after a review pass that found four more defects** — one of
+which meant the capture fix this phase is named for applied to no archive that
+already existed (finding 7). Scope is complete as written: `exchanges_fts` maintained
 transactionally, the weighted `commands` column, `tmem <query>` as the default
 verb with the `PATH` collision check already in `init`, `--in`/`--since`/
 `--repo`/`--json`/`--limit`, highlighted snippets, pipe detection, exit codes,
@@ -244,6 +303,8 @@ What was surprising, in order:
    been read many times by then.
 5. That the sidechain records both earlier phases recorded as absent were in a
    directory nothing looks in.
+6. That the phase's headline fix reached no existing archive, guarded by a
+   comment explaining the previous version of the same mistake (finding 7).
 
 ## Carried forward
 
@@ -261,6 +322,11 @@ What was surprising, in order:
 - **The volume question**, untouched for a third phase. 1.3 MB for five days of
   documentation work still says nothing about a code-heavy archive, and Phase 3
   needs that scan.
+- **No test has ever run the terminal formatting path.** Every integration test
+  drives the binary through a pipe, so `print_hits`, `highlight` and the escape
+  handling are covered only by unit tests calling them with `tty: true`. Two of
+  the four review findings lived there. A pty harness is the obvious answer and
+  is not written.
 - **Ranking quality has no measurement.** The weights (`8 / 2 / 1`) are a
   judgement. Phase 5's premise is that months of real queries will say whether
   keyword search misses things; nothing currently records a query, and

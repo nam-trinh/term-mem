@@ -3,6 +3,11 @@
 
 use crate::db::queries::Exchange;
 use crate::search::{Hit, HL_CLOSE, HL_OPEN};
+
+/// Bold yellow, and its reset. Every `HL_ON` in a rendered string has a
+/// matching `HL_OFF`, including on a truncated one.
+const HL_ON: &str = "\x1b[1;33m";
+const HL_OFF: &str = "\x1b[0m";
 use std::io::IsTerminal;
 
 /// docs/cli.md: `0` found, `1` nothing found, `2` error.
@@ -227,13 +232,13 @@ fn matched_terms(snippet: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = snippet;
     while let Some(o) = rest.find(HL_OPEN) {
-        let after = &rest[o + HL_OPEN.len()..];
+        let after = &rest[o + HL_OPEN.len_utf8()..];
         let Some(c) = after.find(HL_CLOSE) else { break };
         let term = after[..c].to_lowercase();
         if !term.is_empty() && !out.contains(&term) {
             out.push(term);
         }
-        rest = &after[c + HL_CLOSE.len()..];
+        rest = &after[c + HL_CLOSE.len_utf8()..];
     }
     out
 }
@@ -243,26 +248,47 @@ fn hits_any(text: &str, terms: &[String]) -> bool {
     terms.iter().any(|t| lower.contains(t.as_str()))
 }
 
+/// How many bytes of `hay` a case-insensitive match of `term` consumes, if it
+/// matches at the start.
+///
+/// Written this way because the obvious version is a latent panic: lowercasing
+/// the haystack and indexing it with offsets taken from the original assumes
+/// the two have the same byte length, and `İ` (U+0130) lowercases to two chars.
+/// A command line containing one used to abort the process with exit 101.
+fn match_len(hay: &str, term: &str) -> Option<usize> {
+    let mut lowered = String::new();
+    let mut consumed = 0;
+    for ch in hay.chars() {
+        lowered.extend(ch.to_lowercase());
+        consumed += ch.len_utf8();
+        if lowered == term {
+            return Some(consumed);
+        }
+        if !term.starts_with(&lowered) {
+            return None;
+        }
+    }
+    None
+}
+
 fn highlight(text: &str, terms: &[String], tty: bool) -> String {
     let flat = one_line(text, 200);
     if !tty {
         return flat;
     }
-    let lower = flat.to_lowercase();
     let mut out = String::with_capacity(flat.len());
     let mut i = 0;
     while i < flat.len() {
-        let hit = terms
-            .iter()
-            .filter(|t| lower[i..].starts_with(t.as_str()))
-            .max_by_key(|t| t.len());
-        match hit {
-            Some(t) => {
-                out.push_str(&format!("\x1b[1;33m{}\x1b[0m", &flat[i..i + t.len()]));
-                i += t.len();
+        let longest = terms.iter().filter_map(|t| match_len(&flat[i..], t)).max();
+        match longest {
+            Some(n) => {
+                out.push_str(HL_ON);
+                out.push_str(&flat[i..i + n]);
+                out.push_str(HL_OFF);
+                i += n;
             }
             None => {
-                let ch = flat[i..].chars().next().unwrap();
+                let ch = flat[i..].chars().next().expect("i is a char boundary");
                 out.push(ch);
                 i += ch.len_utf8();
             }
@@ -273,14 +299,50 @@ fn highlight(text: &str, terms: &[String], tty: bool) -> String {
 
 /// Swap FTS5's markers for terminal escapes, or drop them on a pipe — the
 /// markers are control characters and must never reach a file.
+///
+/// Truncation counts *visible* characters and happens in the same pass, because
+/// cutting the string first can cut between an opening marker and its closing
+/// one — which leaves the escape unbalanced and the user's terminal bold yellow
+/// after the process exits.
 fn render_snippet(snippet: &str, tty: bool) -> String {
-    let flat = one_line(snippet, 200);
-    if tty {
-        flat.replace(HL_OPEN, "\x1b[1;33m")
-            .replace(HL_CLOSE, "\x1b[0m")
-    } else {
-        flat.replace(HL_OPEN, "").replace(HL_CLOSE, "")
+    const MAX: usize = 200;
+    let flat = snippet.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = String::with_capacity(flat.len());
+    let mut visible = 0;
+    let mut open = false;
+    let mut truncated = false;
+
+    for ch in flat.chars() {
+        match ch {
+            HL_OPEN => {
+                if tty {
+                    out.push_str(HL_ON);
+                    open = true;
+                }
+            }
+            HL_CLOSE => {
+                if tty && open {
+                    out.push_str(HL_OFF);
+                    open = false;
+                }
+            }
+            _ => {
+                if visible == MAX {
+                    truncated = true;
+                    break;
+                }
+                out.push(ch);
+                visible += 1;
+            }
+        }
     }
+    if open {
+        out.push_str(HL_OFF);
+    }
+    if truncated {
+        out.push('…');
+    }
+    out
 }
 
 #[cfg(test)]
@@ -301,6 +363,44 @@ mod tests {
         let out = render_snippet(&s, false);
         assert_eq!(out, "x y z");
         assert!(!out.contains('\x1b'));
+    }
+
+    /// A command line containing `İ` (U+0130) used to abort the process with
+    /// "start byte index N is not a char boundary" and exit 101, which is not
+    /// one of the three exit codes docs/cli.md promises. U+212A took the
+    /// out-of-bounds path instead.
+    #[test]
+    fn highlighting_does_not_panic_when_lowercasing_changes_byte_length() {
+        for text in ["ffmpeg -İ concat", "ffmpeg -\u{212a} concat", "İIİ ffmpeg"] {
+            let out = highlight(text, &["ffmpeg".to_string()], true);
+            assert!(out.contains("ffmpeg"), "{text} -> {out}");
+        }
+        // And the term itself may be the awkward one.
+        let out = highlight("İstanbul notes", &["i\u{307}stanbul".to_string()], true);
+        assert!(out.contains("İstanbul"), "{out}");
+    }
+
+    /// Truncation used to happen before the markers became escapes, so a cut
+    /// between an opening marker and its close emitted `\x1b[1;33m` with no
+    /// reset and left the terminal bold yellow after tmem exited.
+    #[test]
+    fn a_truncated_snippet_still_closes_its_escape() {
+        // The cut has to land *between* the two markers, so the padding is
+        // swept rather than guessed: at 200 visible characters the interesting
+        // widths are around half that in "x " pairs.
+        for pad in 80..210 {
+            let s = format!("{}{HL_OPEN}match{HL_CLOSE} tail", "x ".repeat(pad));
+            let out = render_snippet(&s, true);
+            assert_eq!(
+                out.matches(HL_ON).count(),
+                out.matches(HL_OFF).count(),
+                "unbalanced at pad {pad}: {out:?}"
+            );
+            assert!(
+                !out.ends_with(HL_ON),
+                "opened a highlight with nothing in it at pad {pad}"
+            );
+        }
     }
 
     #[test]

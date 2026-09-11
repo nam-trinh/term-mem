@@ -436,8 +436,23 @@ fn json_output_is_one_clean_record_per_line() {
         assert!(v["snippet"].is_string());
         assert!(v["score"].is_number());
     }
-    assert!(!stdout.contains('\u{1}'), "no highlight markers on a pipe");
+    // Asserting on the raw stdout is what the first version of this test did,
+    // and it passed over a real leak: serde_json escapes U+0001 to the six
+    // characters `\u0001`, which `stdout.contains('\u{1}')` does not see. The
+    // check has to happen on the decoded value.
+    for line in stdout.lines() {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        let snippet = v["snippet"].as_str().unwrap();
+        assert!(
+            !snippet.contains('\u{1}') && !snippet.contains('\u{2}'),
+            "raw FTS5 sentinels reached a --json consumer: {snippet:?}"
+        );
+    }
     assert!(!stdout.contains('\u{1b}'), "no escapes on a pipe");
+    assert!(
+        !stdout.contains("\\u0001"),
+        "the sentinels are escaped rather than removed: {stdout}"
+    );
 }
 
 /// docs/scenarios.md scenario 3: "$ tmem forget --since '18 hours ago'" and
@@ -515,4 +530,98 @@ fn a_bulk_forget_survives_the_next_ingest() {
     e.cmd().args(["capture", "--all"]).assert().success();
     assert_eq!(e.count("exchanges"), 1, "the forgotten exchange came back");
     e.cmd().args(["search", "quality"]).assert().code(1);
+}
+
+/// Phase 2 changed how prompts are extracted (injected blocks are stripped, not
+/// grounds for rejecting the record). The ingest fast path compared the
+/// response and the *counts* of derived rows, so an exchange already in the
+/// archive kept its old prompt through every subsequent re-ingest — the
+/// headline fix of the phase reaching only exchanges captured after it.
+///
+/// Written from the promise: "re-ingesting a transcript makes the row agree
+/// with it", not "the row exists".
+#[test]
+fn re_ingest_rewrites_a_row_whose_prompt_extraction_changed() {
+    let e = Env::new();
+    let path = e.ingest("finding-09-many-to-one.jsonl");
+
+    // Stand in for a row written by an older binary: a prompt that the current
+    // extractor would strip, with the response and every derived count left
+    // exactly as they are.
+    {
+        let conn = rusqlite::Connection::open(e.db()).unwrap();
+        conn.execute(
+            "UPDATE exchanges SET prompt = '<system-reminder>stale</system-reminder>' || prompt",
+            [],
+        )
+        .unwrap();
+    }
+    e.cmd()
+        .args(["search", "reminder"])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("stale"));
+
+    e.cmd()
+        .args(["capture", "--path"])
+        .arg(&path)
+        .assert()
+        .success();
+
+    e.cmd().args(["search", "reminder"]).assert().code(1);
+    e.cmd().args(["search", "stale"]).assert().code(1);
+}
+
+/// The same hole, one column over: a command whose text changed but whose
+/// count did not left `commands_text` — the column weighted 8x at rank time —
+/// holding the old command, so search matched a command line the archive no
+/// longer contains.
+#[test]
+fn re_ingest_rewrites_a_command_that_changed_without_changing_count() {
+    let e = Env::new();
+    let path = e.ingest("finding-09-many-to-one.jsonl");
+    let src = std::fs::read_to_string(&path).unwrap();
+    let updated = src.replace(
+        "ffprobe -v error out.mp4",
+        "ffprobe -loglevel quiet out.mp4",
+    );
+    assert_ne!(src, updated, "the fixture should contain the command");
+    std::fs::write(&path, updated).unwrap();
+
+    e.cmd()
+        .args(["capture", "--path"])
+        .arg(&path)
+        .assert()
+        .success();
+
+    e.cmd().args(["search", "loglevel"]).assert().code(0);
+    e.cmd().args(["search", "-v"]).assert().code(2);
+    let cmds = e.query("SELECT commands_text FROM exchanges");
+    assert!(
+        cmds.iter().all(|c| !c.contains("ffprobe -v error")),
+        "the index still holds a command the transcript no longer has: {cmds:?}"
+    );
+}
+
+/// A command line with a character whose lowercase is longer in bytes used to
+/// abort the process — on the terminal path only, so nothing in this suite saw
+/// it. Exit 101 is not one of the codes docs/cli.md promises.
+#[test]
+fn a_result_containing_awkward_unicode_does_not_abort() {
+    let e = Env::new();
+    e.write_transcript(
+        "unicode.jsonl",
+        &exchange(
+            42,
+            "2026-05-01T00:00:00.000Z",
+            "/home/dev/src/i18n",
+            "main",
+            "how do I normalise the Turkish dotted I",
+            "Use full case folding.",
+            Some("ffmpeg -i İstanbul.mp4 -c copy out.mp4"),
+        ),
+    );
+    e.cmd().args(["capture", "--all"]).assert().success();
+    e.cmd().args(["ffmpeg"]).assert().code(0);
+    e.cmd().args(["search", "istanbul"]).assert().code(0);
 }
