@@ -57,14 +57,23 @@ impl IngestStats {
 /// lost."
 ///
 /// Every field that carries text the user or the assistant produced goes
-/// through it — the prompt, the response, and the mined command lines, which
-/// are where a pasted `curl -H 'Authorization: …'` actually lands.
+/// through it — the prompt, the response, the mined command lines (where a
+/// pasted `curl -H 'Authorization: …'` actually lands), and the mined file
+/// paths.
 fn redact_exchange(redactor: &Redactor, ex: &mut ParsedExchange) -> RedactReport {
     let mut report = RedactReport::default();
     report.merge(&redactor.scrub(&mut ex.prompt));
     report.merge(&redactor.scrub(&mut ex.response));
     for c in &mut ex.commands {
         report.merge(&redactor.scrub(&mut c.cmd));
+    }
+    // File paths too. A `Read` of `/home/dev/secrets/ghp_….pem` puts the
+    // credential in `file_refs` and in every export, and a site-specific
+    // hostname or ticket id is at least as likely to appear in a path as in
+    // prose. Missed in the first cut of this phase, which claimed in this very
+    // comment to cover "every field that carries text".
+    for f in &mut ex.files {
+        report.merge(&redactor.scrub(&mut f.path));
     }
     report
 }

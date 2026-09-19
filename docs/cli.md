@@ -172,6 +172,9 @@ min_len = 20
 
 A rule that does not compile is a **fatal** error, not a warning: a redactor the
 user believes is running and which silently is not is the worst outcome here.
+Because the capture drainer runs detached with its stderr discarded, `tmem
+doctor` also loads the ruleset and reports a broken file — otherwise capture
+stops and nothing says why.
 
 **The entropy fallback is off by default.** It catches assignment-shaped
 high-entropy values that no pattern rule knows, and on a real archive every

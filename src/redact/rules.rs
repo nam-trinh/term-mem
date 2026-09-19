@@ -180,9 +180,14 @@ impl Ruleset {
                 "auth-header",
                 r"(?i)authorization\s*:\s*(?:bearer|basic|token)\s+([A-Za-z0-9._\-+/=]{8,})",
             ),
+            // The password class excludes `:` and `[` deliberately. `:`
+            // terminates the userinfo in a URL so a password cannot contain a
+            // raw one — and allowing it let this rule match its own
+            // `[redacted:url-credentials]` output, rewriting the same string
+            // until the loop guard tripped and reporting `×10001`.
             (
                 "url-credentials",
-                r"[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s/@:]+:([^\s/@]{3,})@",
+                r"[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s/@:]+:([^\s/@:\[]{3,})@",
             ),
         ];
         Ruleset(
@@ -200,6 +205,13 @@ impl Ruleset {
         let mut set = Ruleset::builtin();
         set.0.push(entropy_rule(min_bits, min_len));
         set
+    }
+
+    /// Append a rule. Used by tests to build a deliberately pathological
+    /// ruleset; the loader pushes directly.
+    #[cfg(test)]
+    pub fn push(&mut self, rule: Rule) {
+        self.0.push(rule);
     }
 
     #[cfg_attr(not(test), allow(dead_code))]

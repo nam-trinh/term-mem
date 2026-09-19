@@ -197,10 +197,63 @@ build: 12 s before this phase, 15 s after, for 100,000 exchanges — roughly
 **30 µs per exchange** for thirteen pattern rules. No budget covers ingest
 throughput, and on this evidence none needs to.
 
+## 7. A review found five more, and the first one broke the Exit criterion
+
+1. **Mined file paths were not redacted.** `redact_exchange` covered the
+   prompt, the response and the command lines — and said so in a comment
+   claiming it covered "every field that carries text". It did not cover
+   `ex.files`. A `Read` of `/home/dev/secrets/ghp_….pem` put the credential in
+   `file_refs`, in the raw database bytes and in every export, with `redacted`
+   left at 0. Verified against the built binary before fixing.
+
+   Finding 5 above congratulates this phase for testing the *directory* rather
+   than the file. It did — and then the Exit criterion failed anyway, on a
+   field the test never fed a secret into. Widening where you look does not
+   help if you never put the secret there.
+
+2. **`url-credentials` matched its own replacement.** Its password class
+   allowed `:`, so `[redacted:url-credentials]` matched the rule that produced
+   it. The text converged, so the output was right, but `scrub` rewrote the
+   same bytes until the 10,000-iteration guard tripped — ten thousand full-text
+   regex scans per exchange on the ingest path, and a report reading `×10001`.
+   Fixed in the pattern; `scrub` also gained a guard, because a *user* rule can
+   do the same and no shipped regex controls those.
+
+3. **The tests read the developer's real `~/.config/term-mem/redact.toml`.**
+   `Env::cmd()` set `TMEM_HOME` and the transcript paths but not
+   `TMEM_CONFIG_DIR` or `HOME`. A local `[entropy] enabled = true` failed one
+   test and made several others pass for the wrong reason. The suite that
+   proved this phase depended on the machine it ran on.
+
+4. **`doctor` said "capture looks healthy" while capture was dead.** A rule
+   file that will not compile aborts ingest, which is correct — but the drainer
+   is detached with its stderr discarded, so the user sees capture stop and
+   nothing tell them why. `doctor` now loads the ruleset and reports it. This
+   is the same defect as [phase-1.md](phase-1.md) finding 9's item 8, which was
+   `doctor` printing a problem and then declaring health, one release later in a
+   different check.
+
+5. **`status` claimed a file it could not read was plaintext.**
+   `encryption_status` read sixteen bytes and `unwrap_or(true)` on failure, so
+   an unreadable archive printed `encrypted no (readable with sqlite3 and
+   grep)` — a statement about bytes it had just failed to read. In a phase whose
+   entire subject is not overclaiming about what is on disk.
+
+Each fix has a regression test confirmed to fail against the unfixed code. Two
+of the first drafts did not: an integration test for the self-matching rule
+passed because the *pattern* fix alone covered it, and one for `status` passed
+because `status` opens the database before it reaches the header check, so a
+corrupt file failed earlier. Both were replaced with unit tests that reach the
+defect. A test that cannot fail is worse than no test, because it is counted —
+the lesson of [phase-2.md](phase-2.md) finding 8, arrived at again by a
+different road.
+
 ## Verdict
 
-**Phase 3 ships four of six scope items, and the two it does not are findings
-rather than omissions.** Pattern-rule redaction pre-write, the `redacted` flag
+**Phase 3 ships four of six scope items, after a review pass that found five
+more defects — one of which broke the Exit criterion this document had already
+claimed was met (finding 7).** The two unshipped items are findings rather than
+omissions. Pattern-rule redaction pre-write, the `redacted` flag
 with counts in `capture` and `status`, the user rule file, the audited deletion
 path, and `export`/`import` are all in. The entropy fallback is implemented and
 off. Encryption at rest is not implemented.
@@ -227,6 +280,9 @@ What was surprising, in order:
    cause of.
 5. That `export` inheriting the browse default of 20 would have silently handed
    someone a twentieth of their archive as a backup.
+6. That the deletion test was widened to read the whole data directory and the
+   Exit criterion still failed — on a field no test had put a secret into
+   (finding 7).
 
 ## Carried forward
 

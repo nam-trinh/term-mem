@@ -17,6 +17,8 @@
 
 mod rules;
 
+#[cfg(test)]
+pub use rules::Rule;
 pub use rules::{user_rules_path, Ruleset};
 
 /// What one pass over an exchange changed.
@@ -92,6 +94,14 @@ impl Redactor {
             let mut n = 0;
             let replacement = format!("[redacted:{}]", rule.name);
             while let Some(range) = rule.find(text) {
+                // A rule that matches its own replacement would otherwise
+                // rewrite the same bytes until the guard below trips: correct
+                // output, a nonsense count, and ten thousand full-text scans on
+                // a budgeted path. User rules can do this too, so the check
+                // belongs here rather than in any one pattern.
+                if text[range.clone()] == replacement {
+                    break;
+                }
                 text.replace_range(range, &replacement);
                 n += 1;
                 if n > 10_000 {
@@ -229,6 +239,43 @@ mod tests {
                     file is src/capture/adapters/claude_code.rs. Run cargo test --release.";
         let (out, report) = r.scrub_str(text);
         assert_eq!(out, text, "{report:?}");
+    }
+
+    /// The guard in `scrub`, exercised by a rule that deliberately matches its
+    /// own replacement. The shipped `url-credentials` rule used to do this by
+    /// accident and was fixed in the pattern — but a *user* rule can do it too,
+    /// and no shipped regex controls those. Without the guard this does not
+    /// terminate until the 10,000-iteration cap, and reports ×10001.
+    #[test]
+    fn a_self_matching_rule_stops_instead_of_spinning() {
+        let mut set = Ruleset::builtin();
+        set.push(Rule::pattern("greedy", r"\[redacted:greedy\]|secretvalue").unwrap());
+        let r = Redactor::new(set);
+        let (out, report) = r.scrub_str("the value is secretvalue ok");
+        assert_eq!(out, "the value is [redacted:greedy] ok");
+        assert_eq!(
+            report.hits,
+            vec![("greedy".to_string(), 1)],
+            "the rule rewrote its own output: {report:?}"
+        );
+    }
+
+    /// `url-credentials` used to match its own `[redacted:url-credentials]`
+    /// output: the text converged, so the result looked right, but `scrub`
+    /// rewrote the same bytes until the loop guard tripped — ten thousand
+    /// full-text regex scans on the ingest path, and a report saying `×10001`.
+    #[test]
+    fn a_rule_cannot_loop_on_its_own_replacement() {
+        let r = default_redactor();
+        let (out, report) = r.scrub_str("psql postgres://admin:hunter2pass@db.example.com/app now");
+        assert!(!out.contains("hunter2pass"), "{out}");
+        assert_eq!(
+            report.hits,
+            vec![("url-credentials".to_string(), 1)],
+            "one credential, one replacement: {report:?}"
+        );
+        assert!(out.starts_with("psql postgres://admin:"), "{out}");
+        assert!(out.ends_with("@db.example.com/app now"), "{out}");
     }
 
     #[test]

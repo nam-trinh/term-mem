@@ -126,6 +126,24 @@ pub fn doctor() -> Result<i32> {
         ok("`tmem` resolves on PATH");
     }
 
+    // A rule file that does not compile aborts ingest — correctly, because
+    // capturing unredacted would be worse. But the drainer is detached with its
+    // stderr discarded, so the user sees capture stop and nothing say why.
+    // `doctor` is the command whose whole job is answering that.
+    let rules_path = crate::redact::user_rules_path()?;
+    match crate::redact::Redactor::load() {
+        Ok(_) if rules_path.exists() => ok(&format!(
+            "redaction rules load from {}",
+            tilde(&rules_path.to_string_lossy())
+        )),
+        Ok(_) => ok("redaction rules load (no user rule file)"),
+        Err(e) => {
+            problems += bad(&format!(
+                "redaction rules will not load, so capture cannot run: {e:#}"
+            ));
+        }
+    }
+
     let root = paths::claude_projects_dir()?;
     let transcripts = crate::capture::claude_transcripts(&root).unwrap_or_default();
     if transcripts.is_empty() {

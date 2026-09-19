@@ -529,3 +529,71 @@ fn paths_and_filenames_survive_even_with_entropy_on() {
         "a path in a command line is not a credential, and losing it is permanent"
     );
 }
+
+/// A `Read` of `/home/dev/secrets/ghp_….pem` puts the credential in
+/// `file_refs`, in the raw database bytes, and in every export — with
+/// `redacted` left at 0. Mined file paths are text the assistant produced and
+/// the first cut of this phase did not pass them through the redactor, while
+/// the function's own comment claimed it covered "every field that carries
+/// text". docs/phases/phase-3.md finding 7.
+#[test]
+fn a_secret_in_a_mined_file_path_is_redacted() {
+    let e = Env::new();
+    e.write_transcript(
+        "path.jsonl",
+        &format!(
+            r#"{{"type":"user","uuid":"u1","parentUuid":null,"sessionId":"s1","timestamp":"2026-04-02T15:00:00.000Z","cwd":"/home/dev/x","message":{{"role":"user","content":"open that key"}}}}
+{{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"s1","timestamp":"2026-04-02T15:00:01.000Z","cwd":"/home/dev/x","message":{{"role":"assistant","model":"m","content":[{{"type":"text","text":"ok"}},{{"type":"tool_use","id":"t1","name":"Read","input":{{"file_path":"/home/dev/secrets/{TOKEN}.pem"}}}}]}}}}
+"#
+        ),
+    );
+    e.cmd().args(["capture", "--all"]).assert().success();
+
+    assert!(
+        !contains(&all_bytes(&e.data()), TOKEN),
+        "a credential in a file path reached the archive"
+    );
+    let paths = e.query("SELECT path FROM file_refs");
+    assert!(
+        paths.iter().all(|p| !p.contains(TOKEN)),
+        "file_refs still holds it: {paths:?}"
+    );
+    assert_eq!(
+        e.query("SELECT CAST(redacted AS TEXT) FROM exchanges"),
+        vec!["1"],
+        "the row must be flagged, or the user cannot tell it was touched"
+    );
+}
+
+/// A rule file that does not compile stops capture, which is right. The drainer
+/// runs detached with its stderr discarded, so the user sees capture stop and
+/// nothing tell them why — and `doctor` is the command whose entire job is
+/// answering that question.
+#[test]
+fn doctor_reports_a_rule_file_that_will_not_compile() {
+    let e = Env::new();
+    e.ingest("finding-09-many-to-one.jsonl");
+    let config = e.home().join("config");
+    std::fs::create_dir_all(&config).unwrap();
+
+    // Not `.success()`: in this harness `tmem` is not on PATH, which doctor
+    // correctly calls a problem. What matters is what it says about the rules.
+    e.cmd()
+        .args(["doctor"])
+        .env("TMEM_CONFIG_DIR", &config)
+        .assert()
+        .stdout(predicate::str::contains("redaction rules load"))
+        .stdout(predicate::str::contains("capture cannot run").not());
+
+    std::fs::write(
+        config.join("redact.toml"),
+        "[[rule]]\nname = \"bad\"\npattern = '('\n",
+    )
+    .unwrap();
+    e.cmd()
+        .args(["doctor"])
+        .env("TMEM_CONFIG_DIR", &config)
+        .assert()
+        .code(2)
+        .stdout(predicate::str::contains("capture cannot run"));
+}
