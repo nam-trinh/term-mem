@@ -42,10 +42,13 @@ cargo build && cargo test && cargo clippy --all-targets && cargo fmt --check
 cargo test --release --test budget -- --nocapture    # measured budgets
 ```
 
-The budget suite is release-only and slow: it measures the hook at the turn
-boundary (< 5 ms) and a cold query against a generated 100k-exchange archive
-(p95 < 100 ms), which it builds by ingesting transcripts through the real
-parser. Unit tests sit beside the code; `tests/` drives the real binary against
+The budget suite is slow and **only asserts in release**: it measures the hook
+at the turn boundary (< 5 ms) and a cold query against a generated
+100k-exchange archive (p95 < 100 ms), which it builds by ingesting transcripts
+through the real parser. A debug build is ~3x slower, so `cargo test` runs the
+measurement and prints it without enforcing — a wall-clock budget checked
+against the wrong binary is a flaky gate, and a flaky gate trains people to
+re-run. Unit tests sit beside the code; `tests/` drives the real binary against
 a temp database, and `tests/search.rs` runs scenarios 1 and 2 verbatim. Fixtures are in `tests/fixtures/<adapter>/` — real record *shapes*,
 synthetic content, one per finding in `docs/phases/`. `TMEM_HOME`,
 `TMEM_CLAUDE_PROJECTS` and `TMEM_CLAUDE_SETTINGS` redirect the data directory
