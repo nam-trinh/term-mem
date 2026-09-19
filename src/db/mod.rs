@@ -27,6 +27,31 @@ pub fn open(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Open for reading only, and fail rather than create.
+///
+/// This is what backs the "agents read memory; they never write or delete it"
+/// rule in docs/plan.md. A read-only *flag* on a normal connection would be a
+/// promise; `SQLITE_OPEN_READ_ONLY` is a property of the handle, so a tool that
+/// tried to write would get `attempt to write a readonly database` from SQLite
+/// itself rather than from our good intentions.
+///
+/// Migrations are deliberately not run here — they cannot be, on a read-only
+/// handle. An archive older than the binary fails loudly on the first query,
+/// which is the right way round: `tmem status` is one write-capable command
+/// away and will migrate it.
+pub fn open_readonly(path: &Path) -> Result<Connection> {
+    if !path.exists() {
+        anyhow::bail!("no archive at {} — run `tmem init` first", path.display());
+    }
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("opening database at {} read-only", path.display()))?;
+    conn.busy_timeout(std::time::Duration::from_secs(10))?;
+    Ok(conn)
+}
+
 fn configure(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -69,6 +94,64 @@ pub fn encryption_status(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// docs/plan.md, Phase 4: "Agents read memory; they never write or delete
+    /// it." That is enforced by the open flags, so this is the test that the
+    /// flags are the ones claimed — every agent-facing path in the binary goes
+    /// through `open_readonly` and inherits whatever this handle allows.
+    #[test]
+    fn a_read_only_handle_cannot_write_however_it_is_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.db");
+        {
+            let conn = open(&path).unwrap();
+            conn.execute_batch(
+                "INSERT INTO exchanges (id, assistant, session_id, thread_id, source_key, ts, \
+                 cwd, prompt, response) VALUES \
+                 ('01A','claude-code','s','t','k',0,'/home/dev','q','a')",
+            )
+            .unwrap();
+        }
+        let ro = open_readonly(&path).unwrap();
+        assert_eq!(
+            ro.query_row("SELECT COUNT(*) FROM exchanges", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "reading still works"
+        );
+        for sql in [
+            "DELETE FROM exchanges",
+            "UPDATE exchanges SET prompt = 'x'",
+            "INSERT INTO exchanges (id) VALUES ('02B')",
+            "DROP TABLE exchanges",
+            "CREATE TABLE evil (x)",
+            "INSERT INTO exchanges_fts(exchanges_fts) VALUES('rebuild')",
+        ] {
+            assert!(
+                ro.execute_batch(sql).is_err(),
+                "a read-only handle ran: {sql}"
+            );
+        }
+        // And the archive is untouched.
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM exchanges", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    /// `open` creates; `open_readonly` must not — an agent pointed at the wrong
+    /// path should be told, not handed an empty archive that looks like a user
+    /// with no history.
+    #[test]
+    fn open_readonly_refuses_to_create_an_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nothing-here.db");
+        let e = open_readonly(&path).unwrap_err();
+        assert!(format!("{e:#}").contains("tmem init"), "{e:#}");
+        assert!(!path.exists(), "it created the file it was asked to read");
+    }
 
     /// `status` decides what to print from sixteen bytes of the archive, and
     /// used to treat a *failed read* as "plaintext". An integration test cannot

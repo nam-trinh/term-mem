@@ -44,6 +44,12 @@ pub fn ignore_file() -> Result<PathBuf> {
     Ok(data_dir()?.join("ignore"))
 }
 
+/// Automatic recall's settings. A file, not a row, for the same reason `pause`
+/// is one: the `UserPromptSubmit` hook reads it on every prompt the user types.
+pub fn recall_config() -> Result<PathBuf> {
+    Ok(data_dir()?.join("recall.toml"))
+}
+
 /// Claude Code's transcript root.
 pub fn claude_projects_dir() -> Result<PathBuf> {
     if let Some(p) = std::env::var_os("TMEM_CLAUDE_PROJECTS") {

@@ -113,9 +113,9 @@ pub fn run(backfill: bool, no_hook: bool) -> Result<i32> {
     Ok(crate::output::EXIT_OK)
 }
 
-const HOOK_COMMAND: &str = "tmem capture --hook claude-code";
+pub const HOOK_COMMAND: &str = "tmem capture --hook claude-code";
 
-enum HookState {
+pub enum HookState {
     Added(String),
     AlreadyPresent(String),
 }
@@ -123,45 +123,122 @@ enum HookState {
 /// Register the `Stop` hook by editing Claude Code's settings.json in place,
 /// preserving everything else in the file.
 fn register_hook() -> Result<HookState> {
+    add_hook("Stop", HOOK_COMMAND)
+}
+
+/// Add one command hook under `hooks.<event>`, preserving everything else in
+/// settings.json. Idempotent: an entry already naming the command is left
+/// alone.
+///
+/// Phase 4 made this shared. `tmem recall --enable` registers a
+/// `UserPromptSubmit` hook through the same code, because two hand-rolled
+/// settings.json editors is two chances to corrupt a file that is not ours.
+pub fn add_hook(event: &str, command: &str) -> Result<HookState> {
     let path = paths::claude_settings_file()?;
     let display = path.to_string_lossy().into_owned();
-    let mut root: Value = if path.exists() {
-        let text = std::fs::read_to_string(&path).with_context(|| format!("reading {display}"))?;
-        if text.trim().is_empty() {
-            json!({})
-        } else {
-            serde_json::from_str(&text).with_context(|| format!("parsing {display}"))?
-        }
-    } else {
-        if let Some(p) = path.parent() {
-            std::fs::create_dir_all(p)?;
-        }
-        json!({})
-    };
+    let mut root = read_settings(&path)?;
 
     let hooks = root
         .as_object_mut()
         .context("settings.json is not a JSON object")?
         .entry("hooks")
         .or_insert_with(|| json!({}));
-    let stop = hooks
+    let list = hooks
         .as_object_mut()
         .context("settings.json `hooks` is not a JSON object")?
-        .entry("Stop")
+        .entry(event)
         .or_insert_with(|| json!([]));
-    let stop = stop
+    let list = list
         .as_array_mut()
-        .context("settings.json `hooks.Stop` is not an array")?;
+        .with_context(|| format!("settings.json `hooks.{event}` is not an array"))?;
 
-    if serde_json::to_string(&stop)?.contains(HOOK_COMMAND) {
+    if serde_json::to_string(&list)?.contains(command) {
         return Ok(HookState::AlreadyPresent(display));
     }
-    stop.push(json!({ "hooks": [{ "type": "command", "command": HOOK_COMMAND }] }));
-
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(&root)?)?;
-    std::fs::rename(&tmp, &path)?;
+    list.push(json!({ "hooks": [{ "type": "command", "command": command }] }));
+    write_settings(&path, &root)?;
     Ok(HookState::Added(display))
+}
+
+/// Remove every hook entry naming `command` from `hooks.<event>`, and nothing
+/// else. Returns how many were taken out.
+pub fn remove_hook(event: &str, command: &str) -> Result<usize> {
+    let path = paths::claude_settings_file()?;
+    if !path.exists() {
+        return Ok(0);
+    }
+    let mut root = read_settings(&path)?;
+    let Some(list) = root
+        .get_mut("hooks")
+        .and_then(|h| h.get_mut(event))
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(0);
+    };
+    // Drop only the *inner* entries that name our command, then drop a group
+    // that is left empty. A user's own hooks may share the group and must
+    // survive — which is also why the count is of entries removed, not of
+    // groups: removing ours from a group that keeps others still changed the
+    // file, and a `removed == 0` there would skip the write.
+    let mut removed = 0usize;
+    list.retain_mut(|group| {
+        if let Some(inner) = group.get_mut("hooks").and_then(Value::as_array_mut) {
+            let before = inner.len();
+            inner.retain(|h| h.get("command").and_then(Value::as_str) != Some(command));
+            removed += before - inner.len();
+            !inner.is_empty()
+        } else if group.get("command").and_then(Value::as_str) == Some(command) {
+            removed += 1;
+            false
+        } else {
+            true
+        }
+    });
+    if removed > 0 {
+        write_settings(&path, &root)?;
+    }
+    Ok(removed)
+}
+
+pub fn hook_registered(event: &str, command: &str) -> bool {
+    let Ok(path) = paths::claude_settings_file() else {
+        return false;
+    };
+    let Ok(root) = read_settings(&path) else {
+        return false;
+    };
+    root.get("hooks")
+        .and_then(|h| h.get(event))
+        .map(|l| {
+            serde_json::to_string(l)
+                .unwrap_or_default()
+                .contains(command)
+        })
+        .unwrap_or(false)
+}
+
+fn read_settings(path: &std::path::Path) -> Result<Value> {
+    let display = path.to_string_lossy().into_owned();
+    if path.exists() {
+        let text = std::fs::read_to_string(path).with_context(|| format!("reading {display}"))?;
+        if text.trim().is_empty() {
+            return Ok(json!({}));
+        }
+        return serde_json::from_str(&text).with_context(|| format!("parsing {display}"));
+    }
+    if let Some(p) = path.parent() {
+        std::fs::create_dir_all(p)?;
+    }
+    Ok(json!({}))
+}
+
+fn write_settings(path: &std::path::Path, root: &Value) -> Result<()> {
+    // Write-then-rename: this is the user's file and a half-written
+    // settings.json costs them their whole hook configuration, not just ours.
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(root)?)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// Is there already a `tmem` on PATH that is not us?

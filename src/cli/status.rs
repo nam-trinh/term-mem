@@ -64,6 +64,30 @@ pub fn status() -> Result<i32> {
     }
     println!("  encrypted   {}", crate::db::encryption_status(&db_path));
 
+    // Phase 4. What an agent can reach, and whether anything is being injected
+    // into prompts — the second of which the user must never have to guess at.
+    let recall = crate::cli::recall::Config::load()?;
+    let recall_hooked = crate::cli::init::hook_registered(
+        crate::cli::recall::HOOK_EVENT,
+        crate::cli::recall::HOOK_COMMAND,
+    );
+    println!(
+        "  recall      {}",
+        match (recall.enabled, recall_hooked) {
+            (true, true) => format!(
+                "ON — up to {} exchange(s), ~{} tokens, prepended to prompts",
+                recall.max_exchanges, recall.max_tokens
+            ),
+            (false, false) => "off (the default) — `tmem recall --enable`".to_string(),
+            (c, h) => format!(
+                "INCONSISTENT — config says enabled={c}, {} hook {} — run `tmem recall \
+                 --enable` or `--disable`",
+                crate::cli::recall::HOOK_EVENT,
+                if h { "is registered" } else { "is absent" }
+            ),
+        }
+    );
+
     // Pause state must be visible.
     match pause::state()? {
         Pause::No => println!("  capture     ON"),
@@ -75,6 +99,12 @@ pub fn status() -> Result<i32> {
     }
     if std::env::var("TMEM").map(|v| v == "0").unwrap_or(false) {
         println!("  note        TMEM=0 is set in this shell; capture is off for it");
+    }
+    let mcp_hooked = std::fs::read_to_string(paths::claude_settings_file()?)
+        .map(|s| s.contains("tmem mcp"))
+        .unwrap_or(false);
+    if mcp_hooked {
+        println!("  mcp         registered in Claude Code's settings (read-only)");
     }
     let ignored = crate::cli::ignore::load()?;
     if !ignored.is_empty() {
@@ -141,6 +171,47 @@ pub fn doctor() -> Result<i32> {
             problems += bad(&format!(
                 "redaction rules will not load, so capture cannot run: {e:#}"
             ));
+        }
+    }
+
+    // Phase 4. The recall config and its hook are two files that can disagree,
+    // and the direction of the disagreement decides whether the user is being
+    // injected into without knowing, or believes they are and is not.
+    let recall = match crate::cli::recall::Config::load() {
+        Ok(c) => Some(c),
+        Err(e) => {
+            problems += bad(&format!(
+                "automatic recall settings will not parse: {e:#} — the hook injects nothing \
+                 until this is fixed"
+            ));
+            None
+        }
+    };
+    if let Some(recall) = recall {
+        let hooked = crate::cli::init::hook_registered(
+            crate::cli::recall::HOOK_EVENT,
+            crate::cli::recall::HOOK_COMMAND,
+        );
+        match (recall.enabled, hooked) {
+            (false, false) => ok("automatic recall is off (the default); nothing is injected"),
+            (true, true) => ok(&format!(
+                "automatic recall is on: up to {} exchange(s), ~{} tokens, {}",
+                recall.max_exchanges,
+                recall.max_tokens,
+                crate::cli::recall::describe_floor(&recall)
+            )),
+            (true, false) => {
+                problems += bad(
+                    "automatic recall says enabled, but no UserPromptSubmit hook is registered — \
+                 nothing is being injected (`tmem recall --enable`)",
+                )
+            }
+            (false, true) => {
+                problems += bad(
+                    "a UserPromptSubmit hook for tmem is registered while recall says disabled — \
+                 it injects nothing, but remove it with `tmem recall --disable`",
+                )
+            }
         }
     }
 

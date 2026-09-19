@@ -1,7 +1,7 @@
 //! term-mem — a local memory layer for terminal AI conversations.
 //!
-//! Phase 3: capture, browse, keyword recall, redaction and honest
-//! deletion. See docs/plan.md.
+//! Phase 4: capture, browse, keyword recall, redaction, honest deletion, and
+//! reuse — memory going back into a live session. See docs/plan.md.
 //!
 //! There is no network code in this binary, by design and by promise. See
 //! docs/mission.md: nothing leaves the machine.
@@ -9,6 +9,7 @@
 mod capture;
 mod cli;
 mod db;
+mod mcp;
 mod output;
 mod paths;
 mod redact;
@@ -129,6 +130,51 @@ enum Command {
     },
     /// Read exchanges back in from an export
     Import { path: PathBuf },
+    /// Serve the archive to an agent over the Model Context Protocol (stdio)
+    ///
+    /// Read-only. Register it with:
+    ///   claude mcp add term-mem -- tmem mcp
+    Mcp,
+    /// Print the agent tool definitions, for a model that is not an MCP client
+    Tools {
+        /// Which envelope: `openai` (function calling) or `mcp`
+        #[arg(long, default_value = "openai")]
+        schema: String,
+    },
+    /// Run one agent tool and print its JSON result
+    Call {
+        /// search_memory, get_exchange, or recent
+        tool: String,
+        /// Arguments as a JSON object; `-` reads them from stdin
+        #[arg(long, value_name = "JSON")]
+        args: Option<String>,
+    },
+    /// Format `--json` records on stdin as a context block to prepend
+    Render {
+        /// The context block. Currently the only rendering there is.
+        #[arg(long = "prompt-block")]
+        prompt_block: bool,
+        /// At most this many exchanges
+        #[arg(long, short = 'n')]
+        limit: Option<usize>,
+        /// Roughly this many tokens, estimated at four characters each
+        #[arg(long, value_name = "N")]
+        max_tokens: Option<usize>,
+    },
+    /// Automatic recall on prompt submit — off by default
+    Recall {
+        /// Words from a prompt: show what would be injected, and why
+        query: Vec<String>,
+        /// Turn it on and register the UserPromptSubmit hook
+        #[arg(long)]
+        enable: bool,
+        /// Turn it off and remove the hook
+        #[arg(long)]
+        disable: bool,
+        /// Run as the UserPromptSubmit hook, reading its payload on stdin
+        #[arg(long)]
+        hook: bool,
+    },
     /// Permanently delete an exchange
     Forget {
         id: Option<String>,
@@ -197,6 +243,35 @@ fn run() -> anyhow::Result<i32> {
         Command::Pause { duration } => cli::pause::pause(duration.as_deref()),
         Command::Resume => cli::pause::resume(),
         Command::Ignore { path, list, remove } => cli::ignore::run(path, list, remove),
+        Command::Mcp => cli::mcp_serve(),
+        Command::Tools { schema } => cli::tools::tools(&schema),
+        Command::Call { tool, args } => cli::tools::call(&tool, args.as_deref()),
+        Command::Render {
+            prompt_block,
+            limit,
+            max_tokens,
+        } => {
+            if !prompt_block {
+                anyhow::bail!(
+                    "tmem render: say what to render — `--prompt-block` is the only \
+                     rendering there is"
+                );
+            }
+            cli::render::run(limit, max_tokens)
+        }
+        Command::Recall {
+            query,
+            enable,
+            disable,
+            hook,
+        } => match (enable, disable, hook) {
+            (true, true, _) => anyhow::bail!("tmem recall: --enable and --disable disagree"),
+            (true, _, _) => cli::recall::enable(),
+            (_, true, _) => cli::recall::disable(),
+            (_, _, true) => cli::recall::hook(),
+            _ if !query.is_empty() => cli::recall::preview(&query),
+            _ => cli::recall::status(),
+        },
         Command::Forget {
             id,
             last,

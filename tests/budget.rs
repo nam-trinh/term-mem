@@ -17,6 +17,22 @@ mod common;
 use common::Env;
 use std::time::Instant;
 
+/// The two measurements in this file must not run at the same time.
+///
+/// They did, and it made the documented command
+/// (`cargo test --release --test budget -- --nocapture`) fail intermittently:
+/// generating the 100k-exchange archive saturates the disk, and the `Stop` hook
+/// p95 measured alongside it came out at 5.62 ms against a 5 ms budget rather
+/// than the 2.5 ms it measures on its own. A latency budget measured against a
+/// machine doing something else is not a measurement of this program.
+static EXCLUSIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the lock, ignoring poisoning — a panic in the other test means it
+/// failed its own assertion, not that this one's measurement is invalid.
+fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+    EXCLUSIVE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 const BUDGET_MS: f64 = 5.0;
 const ITERATIONS: usize = 60;
 
@@ -50,6 +66,7 @@ fn measure(e: &Env, transcript: &std::path::Path) -> Vec<f64> {
 
 #[test]
 fn hook_latency_is_under_five_milliseconds() {
+    let _guard = exclusive();
     let e = Env::new();
     e.cmd().args(["init", "--no-hook"]).assert().success();
     let small = e.install("finding-09-many-to-one.jsonl");
@@ -167,6 +184,7 @@ fn generate(e: &Env) -> std::path::PathBuf {
 
 #[test]
 fn search_p95_is_under_a_hundred_milliseconds_at_100k_exchanges() {
+    let _guard = exclusive();
     let e = Env::new();
     e.cmd().args(["init", "--no-hook"]).assert().success();
     let built = Instant::now();
@@ -231,5 +249,63 @@ fn search_p95_is_under_a_hundred_milliseconds_at_100k_exchanges() {
     assert!(
         worst < SEARCH_BUDGET_MS,
         "p95 {worst:.2} ms exceeds the {SEARCH_BUDGET_MS} ms budget"
+    );
+
+    // ── Phase 4 ──────────────────────────────────────────────────────────
+    //
+    // docs/plan.md sets no explicit budget for the `UserPromptSubmit` recall
+    // hook, and that is an omission rather than permission: it sits on the turn
+    // boundary exactly as the `Stop` hook does, and unlike that one it cannot
+    // enqueue and run away, because its whole output has to be on stdout before
+    // the prompt is sent. So it is held to the *search* budget, which is what
+    // it actually does, and measured here rather than assumed. It shares this
+    // archive deliberately — generating a second 100k-exchange one to measure
+    // it separately would double a twenty-minute test for no new information.
+    e.cmd().args(["recall", "--enable"]).assert().success();
+
+    // Both ends of what a prompt looks like. The long one is the case that
+    // matters: recall's cost is roughly linear in how many content words the
+    // prompt has, and a user pasting a paragraph is not a rare event, so the
+    // term cap has to be set by *this* number rather than by the short prompt
+    // that happens to be convenient to type.
+    let short = "how do I fix the postgres migration lock problem I hit before";
+    let long = "I am staring at a postgres migration that takes an exclusive lock on the                 whole table while it backfills a column, and the replicas drift behind                 until the ingress controller starts returning gateway timeouts, which                 looks a lot like the redis eviction problem from before, except the                 checkpoint table should have prevented exactly this";
+    let mut worst_recall: f64 = 0.0;
+    for (name, prompt) in [("recall short", short), ("recall long", long)] {
+        let payload = serde_json::json!({
+            "session_id": "not-a-session-in-this-archive",
+            "cwd": "/home/dev",
+            "prompt": prompt,
+            "hook_event_name": "UserPromptSubmit",
+        })
+        .to_string();
+        let mut samples = Vec::with_capacity(30);
+        for i in 0..35 {
+            let t = Instant::now();
+            e.cmd()
+                .args(["recall", "--hook"])
+                .write_stdin(payload.clone())
+                .assert()
+                .success();
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            if i >= 5 {
+                samples.push(ms);
+            }
+        }
+        samples.sort_by(f64::total_cmp);
+        let p95 = percentile(&samples, 0.95);
+        println!(
+            "  {name:<16} p50 {:6.2} ms   p95 {p95:6.2} ms   max {:6.2} ms",
+            percentile(&samples, 0.50),
+            samples[samples.len() - 1]
+        );
+        worst_recall = worst_recall.max(p95);
+    }
+    println!();
+    assert!(
+        worst_recall < SEARCH_BUDGET_MS,
+        "the UserPromptSubmit recall hook p95 was {worst_recall:.2} ms, over the \
+         {SEARCH_BUDGET_MS} ms search budget — it is in the way of every prompt the user \
+         types, and unlike the Stop hook it cannot enqueue and run away"
     );
 }
