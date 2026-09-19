@@ -148,11 +148,14 @@ fn run_paths(files: &[PathBuf], force: bool, quiet: bool) -> Result<i32> {
     let mut conn = db::open(&paths::db_path()?)?;
     let ignores = crate::cli::ignore::load()?;
     let adapter = ClaudeCode;
+    // Loaded once per run, not per file: a malformed user rule file is fatal
+    // here rather than partway through an archive.
+    let redactor = crate::redact::Redactor::load()?;
     let mut total = capture::IngestStats::default();
     let mut failed = 0;
 
     for f in files {
-        match capture::ingest_file(&mut conn, &adapter, f, &ignores, force) {
+        match capture::ingest_file(&mut conn, &adapter, f, &ignores, force, &redactor) {
             Ok(s) => {
                 total.files_seen += s.files_seen;
                 total.files_parsed += s.files_parsed;
@@ -171,6 +174,8 @@ fn run_paths(files: &[PathBuf], force: bool, quiet: bool) -> Result<i32> {
                 total.report.sidechain_records += s.report.sidechain_records;
                 total.report.orphaned_records += s.report.orphaned_records;
                 total.report.orphaned_chars += s.report.orphaned_chars;
+                total.redacted_exchanges += s.redacted_exchanges;
+                total.redactions.merge(&s.redactions);
                 for t in s.report.unknown_types {
                     if !total.report.unknown_types.contains(&t) {
                         total.report.unknown_types.push(t);
@@ -206,6 +211,15 @@ fn run_paths(files: &[PathBuf], force: bool, quiet: bool) -> Result<i32> {
                 r.prompts_without_response,
                 r.prompts_unusable,
                 r.api_errors_skipped
+            );
+        }
+        // Never silent. The user has to be able to tell a mangled response
+        // from a bad one — docs/plan.md.
+        if total.redacted_exchanges > 0 {
+            println!(
+                "  redacted: {} exchange(s) — {}",
+                total.redacted_exchanges,
+                total.redactions.summary()
             );
         }
         if total.skipped_forgotten > 0 {

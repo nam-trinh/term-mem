@@ -26,7 +26,9 @@ roadmap is the opt-in model download in Phase 5, behind `tmem embed --enable`.
 - **Capture is irreversible, retrieval is not.** Losing or corrupting a captured
   exchange is unacceptable; a mediocre ranking function is fine and gets
   replaced. Anything mined at capture (commands, file paths) is unrecoverable
-  later — the raw `tool_use` block is never stored.
+  later — the raw `tool_use` block is never stored. This is also why redaction
+  defaults are conservative: a false positive is permanent data loss, not a bad
+  result.
 - **Silent failure is the enemy.** Ingest prefers a loud error, or a
   counted-and-reported skip, over a best-effort guess. Most traps found so far
   produce a plausible-looking archive that is wrong. A counter is not immunity:
@@ -54,10 +56,14 @@ and transcript tree; use them for anything run by hand.
 `src/main.rs` dispatch · `src/cli/` one module per subcommand · `src/db/` schema
 and forward-only refinery migrations · `src/capture/` ingest, hook queue, and
 `adapters/` · `src/search/` FTS5 match building and BM25 ranking ·
+`src/redact/` pre-write pattern rules and the user rule file ·
 `src/output.rs` pipe detection, exit codes, formatting.
 
 `exchanges_fts` is maintained by triggers on `exchanges`, not by the write path.
 Anything that changes a row updates the index without knowing it exists.
+
+**Every write path redacts and honours the `forgotten` tombstone.** There are
+two — transcript ingest and `tmem import` — and a third would need both again.
 
 Adapters declare their own dedup key and injected-block vocabulary; neither is
 universal — see `src/capture/adapters/mod.rs` and

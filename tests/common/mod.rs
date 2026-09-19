@@ -23,7 +23,14 @@ impl Env {
     }
 
     pub fn db(&self) -> PathBuf {
-        self.home().join("data/memory.db")
+        self.data().join("memory.db")
+    }
+
+    /// Everything term-mem itself wrote. Deliberately not `home()`: the fake
+    /// transcript tree lives there too, and a secret in the source transcript
+    /// is the user's own file, not something term-mem stored.
+    pub fn data(&self) -> PathBuf {
+        self.home().join("data")
     }
 
     pub fn projects(&self) -> PathBuf {

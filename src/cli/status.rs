@@ -47,14 +47,22 @@ pub fn status() -> Result<i32> {
             crate::output::fmt_date(nw)
         );
     }
-    // docs/plan.md Phase 3: the redaction count is visible here, because silent
+    // docs/plan.md: the redaction count is visible here, because silent
     // redaction leaves the user unable to tell a mangled response from a bad one.
-    println!("  redacted    {redacted}   (redaction lands in Phase 3)");
+    let rules_path = crate::redact::user_rules_path()?;
+    println!(
+        "  redacted    {redacted} exchange(s){}",
+        if rules_path.exists() {
+            format!("   (rules: {})", tilde(&rules_path.to_string_lossy()))
+        } else {
+            String::new()
+        }
+    );
     let forgotten = queries::forgotten_count(&conn)?;
     if forgotten > 0 {
         println!("  forgotten   {forgotten}   (kept as keys only, so re-ingest cannot undo it)");
     }
-    println!("  encrypted   no    (opt-in encryption lands in Phase 3)");
+    println!("  encrypted   {}", crate::db::encryption_status(&db_path));
 
     // Pause state must be visible.
     match pause::state()? {

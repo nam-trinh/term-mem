@@ -1,7 +1,8 @@
 # term-mem — Scenarios
 
 Status: scenarios 1 and 2 are Phase 2's acceptance tests and now run as
-integration tests against the real binary (`tests/search.rs`). **Scenario 1 runs
+integration tests against the real binary (`tests/search.rs`); scenario 3's
+delete-and-reuse path is Phase 3's, in `tests/redaction.rs`. **Scenario 1 runs
 verbatim, ranking included. Scenario 2 runs verbatim except for one sentence,
 corrected in place below.** Scenario 3's deletion half runs; its redaction half
 is Phase 3.
@@ -256,6 +257,17 @@ things shaped like bearer tokens and API keys. The mission leaves that open, and
 this scenario is the argument for closing it: `forget` is a valve for what
 redaction misses, not a substitute for having it.
 
+**As of Phase 3 it does prevent it**, and the sharper version of the lesson is
+worth keeping. Dana's paste is an `Authorization: Bearer` header — a shape a
+rule knows — so it never reaches the disk and the ten minutes of dread do not
+happen. But the scenario's framing ("a capture-time filter") quietly assumes the
+filter is free. It is not: a false positive replaces a mined command line, which
+is the only copy that will ever exist. That is why the aggressive half of the
+filter ships disabled. See [phases/phase-3.md](phases/phase-3.md) finding 2.
+
+The `forget --last` path below is therefore the *fallback*, and it is still the
+one tested adversarially — by grepping every byte term-mem wrote.
+
 ### The reuse
 
 The diagnosis itself was good and Dana wants to keep it, so she re-asks with the
@@ -299,4 +311,6 @@ Read together, three things the current design should decide:
 2. **`--in` should default to global.** Scenario 2 breaks under an implicit
    `--in .`, and it breaks silently, which is the worst way to break.
 3. **Redaction-on-capture is load-bearing, not a refinement.** Scenario 3's
-   valve works, but it depends on the user noticing. Most won't.
+   valve works, but it depends on the user noticing. Most won't. *(Shipped in
+   Phase 3 for shapes a rule recognises. What the scenario did not anticipate is
+   that the filter has a cost in the other direction — see the note above.)*

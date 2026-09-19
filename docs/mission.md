@@ -85,4 +85,11 @@ in the mission:
 - How conversations are captured across different assistants and terminal setups.
 - Where the line sits between automatic capture and user curation.
 - How much of recall can work offline and locally versus needing embeddings.
-- What secret-redaction on capture should look like, given the sensitivity above.
+- ~~What secret-redaction on capture should look like, given the sensitivity
+  above.~~ **Answered in Phase 3, and not the way this line assumes.** Pattern
+  rules on capture, yes — but the aggressive half of redaction ships *off*,
+  because a mined command line is the only copy that exists and a false positive
+  destroys it. See [phases/phase-3.md](phases/phase-3.md). Note also that
+  "storage the user can open, query, back up, grep" above is a claim encryption
+  at rest would have complicated; it is intact because that feature did not
+  ship.

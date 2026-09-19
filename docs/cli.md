@@ -1,9 +1,9 @@
 # term-mem — CLI surface
 
-Status: Phases 1 and 2 shipped, so searching, browsing, capture control and
-deletion are all now *as implemented* rather than as sketched. Data ownership
-(`export`/`import`) and everything downstream of it are still design. Anything
-not yet built is marked with the phase that owns it.
+Status: Phases 1 to 3 shipped, so searching, browsing, capture control,
+deletion and data ownership are all now *as implemented* rather than as
+sketched. Reuse (`mcp`, `tools`, `call`, `render`) is still design. Anything not
+yet built is marked with the phase that owns it.
 
 ## Name
 
@@ -138,6 +138,50 @@ surprise. Surface it — a prompt segment, a notice on assistant start.
 Path-based ignore is the one that sees real use: there's usually one directory
 whose contents shouldn't be archived even though everything else should.
 
+### Redaction
+
+Credentials with a recognisable shape are replaced *before* anything is written
+— `sk-…`, `ghp_…`, AWS and GCP keys, JWTs, `Authorization:` headers, PEM blocks,
+and the rest of the thirteen shipped rules. The replacement names the rule
+(`[redacted:github-token]`), the row is flagged, and both `capture` and `status`
+count it, because silent redaction leaves the user unable to tell a mangled
+response from a bad one.
+
+```
+$ tmem capture --all
+12 new, 0 updated, from 3 transcript(s) (0 unchanged)
+  redacted: 1 exchange(s) — github-token, aws-access-key ×2
+```
+
+Site-specific shapes go in `~/.config/term-mem/redact.toml` (`$TMEM_CONFIG_DIR`
+redirects it):
+
+```toml
+[[rule]]
+name = "internal-host"
+pattern = '\b[a-z0-9-]+\.corp\.internal\b'
+
+[builtin]
+email = true          # off by default
+
+[entropy]
+enabled = true        # off by default — see below
+min_bits = 4.0
+min_len = 20
+```
+
+A rule that does not compile is a **fatal** error, not a warning: a redactor the
+user believes is running and which silently is not is the worst outcome here.
+
+**The entropy fallback is off by default.** It catches assignment-shaped
+high-entropy values that no pattern rule knows, and on a real archive every
+single thing it caught was a filesystem path or a UUID filename. Because mined
+command lines are the only copy that exists, a false positive is permanent data
+loss. [phases/phase-3.md](phases/phase-3.md) finding 2 has the numbers.
+
+Redaction is prevention, not a guarantee. `forget` is the valve for what it
+misses.
+
 ### Deleting
 
 The real safety valve. People realize *after* the fact that they pasted a
@@ -168,20 +212,45 @@ The search index needs no mention here because it is maintained by triggers on
 the row: a delete that reaches `exchanges` has already reached `exchanges_fts`.
 
 These are genuine deletes, including from the search index — never a hidden
-flag on a row that stays on disk.
+flag on a row that stays on disk. An integration test reads every byte of every
+file in the data directory afterwards, the WAL included, and fails if the secret
+is in any of them.
+
+What `forget` does **not** touch is the assistant's own transcript, which is the
+user's file and still contains whatever was pasted. The tombstone is what stops
+the next ingest putting it back.
 
 ### Data ownership
 
-*Phase 3.*
-
 ```
 tmem export --json | --markdown
+tmem export --json --in <path> --since <when> --repo
 tmem import <path>
 ```
 
-Export is the concrete form of the mission's ownership promise, and matters more
-if the database is encrypted at rest — an encrypted file isn't greppable, so a
-guaranteed open-format export is what keeps the data genuinely the user's.
+Export is the concrete form of the mission's ownership promise. It writes to
+stdout, so it pipes; closing the pipe early (`| head`) is not an error.
+
+**Export ignores the browse default of 20.** `-n` is honoured when given
+explicitly, but a backup that silently contains the first page of an archive is
+worse than no backup. The other filters work, so `export --repo` is a
+per-project extract.
+
+JSON is one record per line — the same shape `--json` produces everywhere else,
+plus `source_key` — and is what `import` reads. Markdown is for people and is
+deliberately not re-importable; a format that is both pretty and lossless is
+neither.
+
+`import` is the second door into the database and behaves like the first: it is
+keyed on the same `(assistant, session_id, source_key)`, so importing twice is a
+no-op; it **redacts on the way in**, because an export may predate a rule the
+user has since added; and it **respects `forget`** — an exchange the user
+deleted does not come back, and the command says how many it left out. One
+unreadable line costs that line, not the import.
+
+This mattered more when encryption was expected to land here. It didn't — see
+[phases/phase-3.md](phases/phase-3.md) finding 3 — so the archive is still an
+ordinary SQLite file the user can open with `sqlite3`, and `status` says so.
 
 ### Setup
 
@@ -198,9 +267,9 @@ tmem capture --all              ingest every transcript on disk
 ```
 
 `init` edits the `Stop` hooks in `~/.claude/settings.json` in place, preserving
-everything else in the file, and is idempotent. It does not ask the encryption
-question yet — encryption is Phase 3 — and `status` says so rather than leaving
-the field blank.
+everything else in the file, and is idempotent. It does not ask an encryption
+question, because there is no encryption to ask about; `status` states that the
+file is readable with `sqlite3` and `grep` rather than leaving the field blank.
 
 The `capture` verb is the one addition to the surface this document sketched. It
 is not really a user command; it is the hook's entrypoint, and it is documented
@@ -208,8 +277,8 @@ because `doctor` names it and because `--path` is how anyone debugs an adapter.
 `--hook` writes a queue entry and spawns a drainer rather than parsing anything,
 which is what keeps the turn boundary under 5 ms.
 
-`init` creates the database, wires up capture, asks the encryption question, and
-prints what it is about to start recording. A tool that silently begins
+`init` creates the database, wires up capture, and prints what it is about to
+start recording. A tool that silently begins
 archiving everything you type is one people uninstall in anger.
 
 `init` also offers to **import existing assistant transcripts** where they're
