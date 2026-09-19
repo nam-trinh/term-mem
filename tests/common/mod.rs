@@ -23,7 +23,14 @@ impl Env {
     }
 
     pub fn db(&self) -> PathBuf {
-        self.home().join("data/memory.db")
+        self.data().join("memory.db")
+    }
+
+    /// Everything term-mem itself wrote. Deliberately not `home()`: the fake
+    /// transcript tree lives there too, and a secret in the source transcript
+    /// is the user's own file, not something term-mem stored.
+    pub fn data(&self) -> PathBuf {
+        self.home().join("data")
     }
 
     pub fn projects(&self) -> PathBuf {
@@ -57,6 +64,13 @@ impl Env {
         c.env("TMEM_HOME", self.home().join("data"))
             .env("TMEM_CLAUDE_PROJECTS", self.projects())
             .env("TMEM_CLAUDE_SETTINGS", self.settings())
+            // Without these the redactor reads the *developer's* real
+            // ~/.config/term-mem/redact.toml, so a local `[entropy] enabled =
+            // true` fails one test and makes several others pass for the wrong
+            // reason. A test that depends on the machine it runs on is not a
+            // test. Individual cases override TMEM_CONFIG_DIR to supply rules.
+            .env("TMEM_CONFIG_DIR", self.home().join("no-config"))
+            .env("HOME", self.home())
             .env_remove("TMEM");
         c
     }

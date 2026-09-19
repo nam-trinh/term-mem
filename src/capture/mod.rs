@@ -7,6 +7,7 @@
 pub mod adapters;
 pub mod queue;
 
+use crate::redact::{Redactor, Report as RedactReport};
 use adapters::{Adapter, ParseReport, ParsedExchange};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -24,6 +25,11 @@ pub struct IngestStats {
     pub inserted: usize,
     pub updated: usize,
     pub report: ParseReport,
+    /// What redaction replaced on the way in. Surfaced by `capture` and
+    /// counted in `status`: silent redaction leaves the user unable to tell a
+    /// mangled response from a bad one.
+    pub redacted_exchanges: usize,
+    pub redactions: RedactReport,
 }
 
 impl IngestStats {
@@ -46,6 +52,32 @@ impl IngestStats {
     }
 }
 
+/// Redact one parsed exchange in place, before anything about it reaches the
+/// database. docs/plan.md: "A redactor that runs after the insert has already
+/// lost."
+///
+/// Every field that carries text the user or the assistant produced goes
+/// through it — the prompt, the response, the mined command lines (where a
+/// pasted `curl -H 'Authorization: …'` actually lands), and the mined file
+/// paths.
+fn redact_exchange(redactor: &Redactor, ex: &mut ParsedExchange) -> RedactReport {
+    let mut report = RedactReport::default();
+    report.merge(&redactor.scrub(&mut ex.prompt));
+    report.merge(&redactor.scrub(&mut ex.response));
+    for c in &mut ex.commands {
+        report.merge(&redactor.scrub(&mut c.cmd));
+    }
+    // File paths too. A `Read` of `/home/dev/secrets/ghp_….pem` puts the
+    // credential in `file_refs` and in every export, and a site-specific
+    // hostname or ticket id is at least as likely to appear in a path as in
+    // prose. Missed in the first cut of this phase, which claimed in this very
+    // comment to cover "every field that carries text".
+    for f in &mut ex.files {
+        report.merge(&redactor.scrub(&mut f.path));
+    }
+    report
+}
+
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -64,6 +96,7 @@ pub fn ingest_file(
     path: &Path,
     ignores: &[PathBuf],
     force: bool,
+    redactor: &Redactor,
 ) -> Result<IngestStats> {
     let mut stats = IngestStats {
         files_seen: 1,
@@ -98,7 +131,7 @@ pub fn ingest_file(
 
     let source = std::fs::read_to_string(path)
         .with_context(|| format!("reading transcript {}", path.display()))?;
-    let (exchanges, report) = adapter.parse(&source, &path_s)?;
+    let (mut exchanges, report) = adapter.parse(&source, &path_s)?;
     stats.files_parsed = 1;
     stats.absorb(report);
 
@@ -109,7 +142,7 @@ pub fn ingest_file(
     // locally it can block for milliseconds each time.
     let mut repos: HashMap<String, Option<String>> = HashMap::new();
     let tx = conn.transaction()?;
-    for ex in &exchanges {
+    for ex in &mut exchanges {
         if is_ignored(Path::new(&ex.cwd), ignores) {
             stats.files_ignored += 1;
             continue;
@@ -119,7 +152,14 @@ pub fn ingest_file(
             .entry(ex.cwd.clone())
             .or_insert_with(|| resolve_repo(Path::new(&ex.cwd)))
             .clone();
-        match write_exchange(&tx, adapter.name(), ex, repo)? {
+        // Pre-write, and before the idempotency lookup: the stored row is the
+        // redacted one, so a re-ingest compares like with like.
+        let redactions = redact_exchange(redactor, ex);
+        if !redactions.is_empty() {
+            stats.redacted_exchanges += 1;
+            stats.redactions.merge(&redactions);
+        }
+        match write_exchange(&tx, adapter.name(), ex, repo, !redactions.is_empty())? {
             Written::Inserted => stats.inserted += 1,
             Written::Updated => stats.updated += 1,
             Written::Unchanged => {}
@@ -163,6 +203,7 @@ fn write_exchange(
     assistant: &str,
     ex: &ParsedExchange,
     repo: Option<String>,
+    redacted: bool,
 ) -> Result<Written> {
     // The transcript outlives the row, so a forgotten exchange would otherwise
     // come straight back on the next ingest of the same file.
@@ -263,7 +304,8 @@ fn write_exchange(
         }
         tx.execute(
             "UPDATE exchanges SET ts = ?2, cwd = ?3, repo = ?4, git_branch = ?5, model = ?6, \
-             prompt = ?7, response = ?8, thread_id = ?9, commands_text = ?10 WHERE id = ?1",
+             prompt = ?7, response = ?8, thread_id = ?9, commands_text = ?10, \
+             redacted = ?11 WHERE id = ?1",
             params![
                 &id,
                 ex.ts_ms,
@@ -274,7 +316,8 @@ fn write_exchange(
                 &ex.prompt,
                 &ex.response,
                 &ex.thread_id,
-                commands_text(ex)
+                commands_text(ex),
+                redacted as i64
             ],
         )?;
         tx.execute("DELETE FROM commands  WHERE exchange_id = ?1", params![&id])?;
@@ -287,7 +330,7 @@ fn write_exchange(
     tx.execute(
         "INSERT INTO exchanges (id, assistant, session_id, thread_id, source_key, ts, cwd, \
          repo, git_branch, model, prompt, response, commands_text, redacted) \
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,0)",
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
         params![
             &id,
             assistant,
@@ -301,7 +344,8 @@ fn write_exchange(
             &ex.model,
             &ex.prompt,
             &ex.response,
-            commands_text(ex)
+            commands_text(ex),
+            redacted as i64
         ],
     )?;
     write_derived(tx, &id, ex)?;
@@ -337,7 +381,7 @@ fn write_derived(tx: &rusqlite::Transaction, id: &str, ex: &ParsedExchange) -> R
 
 /// ULID randomness without a `rand` dependency. Uniqueness only has to hold
 /// within one millisecond on one machine.
-fn rand_u128() -> u128 {
+pub fn rand_u128() -> u128 {
     use std::hash::{BuildHasher, Hasher, RandomState};
     let mut h = RandomState::new().build_hasher();
     h.write_u64(std::process::id() as u64);

@@ -161,7 +161,21 @@ the tokenizer is wrong and adding vectors would hide that.
 
 ---
 
-## Phase 3 — Redaction, and honest deletion
+## Phase 3 — Redaction, and honest deletion ⚠️
+
+**Done 2026-09-19, four of six scope items —
+[phases/phase-3.md](phases/phase-3.md).** Verdict: pattern-rule redaction
+pre-write, the `redacted` flag and counts, the user rule file, the audited
+deletion path and `export`/`import` all ship. Two items did not, in opposite
+directions, and both are findings rather than omissions. **The entropy fallback
+is implemented and off by default**: against the real archive it fired 38 times
+and was wrong 38 times — paths and filenames, never a credential — and because
+the raw `tool_use` block is never stored, each wrong answer destroys a command
+line permanently, which contradicts this roadmap's first principle. **Encryption
+at rest is not implemented**: SQLCipher itself works (verified), but every key
+an unattended capture hook can read sits next to the database it protects, and
+`status` printing `encrypted yes` for that is the one thing this project exists
+not to do. The Exit criterion passes for credentials with a recognisable shape.
 
 *The phase that earns the privacy claim in the mission.*
 
@@ -172,6 +186,10 @@ produced evidence about what a real archive contains. This phase acts on it.
 
 - Gitleaks-style pattern rules plus a Shannon-entropy fallback, applied
   **pre-write**. A redactor that runs after the insert has already lost.
+  **Shipped, with the entropy half off by default** — see
+  [phases/phase-3.md](phases/phase-3.md) finding 2. The rule is one line of
+  config away; what changed is the default, because a false positive here is
+  permanent data loss rather than a bad search result.
 - `redacted` flagged on the row, with the count visible in `status` — silent
   redaction leaves the user unable to tell a mangled response from a bad one.
 - A user rule file, because internal hostname and ticket-ID shapes are
@@ -183,19 +201,34 @@ produced evidence about what a real archive contains. This phase acts on it.
   reaches the index, and the grep-the-file test passes today for `--last`,
   `<id>`, `--since` and `--in`.** What Phase 3 adds is the adversarial version
   of it and the artifacts that do not exist yet.
-- Opt-in encryption at rest (SQLCipher), which is also the moment `export`
+- ~~Opt-in encryption at rest (SQLCipher)~~, which is also the moment `export`
   stops being a nicety: an encrypted file isn't greppable, so the open-format
-  export is what keeps the ownership promise true.
+  export is what keeps the ownership promise true. **Not shipped.** The cipher
+  works; the key management does not. An unattended capture hook needs a key it
+  can read without a human, which puts the key on the same machine, under the
+  same user, in the same directory as the database — so the feature would
+  protect against almost nothing while `status` claimed otherwise. Export ships
+  regardless, and `status` says plainly that the file is greppable. See
+  [phases/phase-3.md](phases/phase-3.md) finding 3.
 - `tmem export` / `import`.
 
 **Exit:** a paste-a-token test, performed adversarially, leaves nothing
-recoverable in the database file.
+recoverable in the database file. **Met for a token with a recognisable shape**,
+verified by grepping every byte of every file term-mem wrote — the database, the
+WAL, and anything beside them. For a secret no rule knows, prevention does not
+fire and `forget` is the valve, tested the same way.
 
 ---
 
 ## Phase 4 — Reuse
 
 *The third pillar. Memory goes back into a live session.*
+
+**Note from Phase 3:** the MCP server is a third read path onto the archive, and
+`import` was the third *write* path — both had to be taught the `forgotten`
+tombstone. Anything added here that reads exchanges must decide what it does
+about redacted rows, and "show them as they are stored" is the answer unless
+something argues otherwise.
 
 **Scope**
 

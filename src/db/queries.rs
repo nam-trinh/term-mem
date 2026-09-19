@@ -5,12 +5,16 @@
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Exchange {
     pub id: String,
     pub assistant: String,
     pub session_id: String,
     pub thread_id: String,
+    /// The adapter's dedup key. Carried in `--json` so that an export is
+    /// re-importable without inventing identity, and so a result can be traced
+    /// back to the record it came from.
+    pub source_key: String,
     pub ts: i64,
     pub cwd: String,
     pub repo: Option<String>,
@@ -19,9 +23,9 @@ pub struct Exchange {
     pub prompt: String,
     pub response: String,
     pub redacted: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub commands: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub files: Vec<String>,
 }
 
@@ -31,6 +35,7 @@ pub fn row_to_exchange(row: &Row) -> rusqlite::Result<Exchange> {
         assistant: row.get("assistant")?,
         session_id: row.get("session_id")?,
         thread_id: row.get("thread_id")?,
+        source_key: row.get("source_key")?,
         ts: row.get("ts")?,
         cwd: row.get("cwd")?,
         repo: row.get("repo")?,
@@ -44,7 +49,7 @@ pub fn row_to_exchange(row: &Row) -> rusqlite::Result<Exchange> {
     })
 }
 
-const SELECT: &str = "SELECT id, assistant, session_id, thread_id, ts, cwd, repo, \
+const SELECT: &str = "SELECT id, assistant, session_id, thread_id, source_key, ts, cwd, repo, \
                       git_branch, model, prompt, response, redacted FROM exchanges";
 
 /// Attach mined commands and file references. Done as a second pass rather than
@@ -233,4 +238,86 @@ pub fn forgotten_count(conn: &Connection) -> Result<i64> {
 
 pub fn count(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row("SELECT COUNT(*) FROM exchanges", [], |r| r.get(0))?)
+}
+
+pub enum Imported {
+    Inserted,
+    AlreadyPresent,
+    /// The user deleted this exchange. `forget` is irreversible on purpose, and
+    /// an import is not a way around it.
+    Forgotten,
+}
+
+/// Write one exchange that came from an export rather than from a transcript.
+///
+/// Keyed on the same `(assistant, session_id, source_key)` as ingest, so
+/// importing the same file twice is a no-op and importing a file that overlaps
+/// the live archive does not duplicate it.
+pub fn import_exchange(tx: &rusqlite::Transaction, ex: &Exchange) -> Result<Imported> {
+    let tombstoned: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM forgotten \
+         WHERE assistant = ?1 AND session_id = ?2 AND source_key = ?3)",
+        params![&ex.assistant, &ex.session_id, &ex.source_key],
+        |r| r.get::<_, i64>(0),
+    )? != 0;
+    if tombstoned {
+        return Ok(Imported::Forgotten);
+    }
+    let present: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM exchanges \
+         WHERE assistant = ?1 AND session_id = ?2 AND source_key = ?3)",
+        params![&ex.assistant, &ex.session_id, &ex.source_key],
+        |r| r.get::<_, i64>(0),
+    )? != 0;
+    if present {
+        return Ok(Imported::AlreadyPresent);
+    }
+
+    // The id from the export is kept when it is free, so ids in someone's notes
+    // keep resolving across a backup and restore.
+    let id_taken: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM exchanges WHERE id = ?1)",
+        params![&ex.id],
+        |r| r.get::<_, i64>(0),
+    )? != 0;
+    let id = if id_taken {
+        ulid::Ulid::from_parts(ex.ts.max(0) as u64, crate::capture::rand_u128()).to_string()
+    } else {
+        ex.id.clone()
+    };
+
+    tx.execute(
+        "INSERT INTO exchanges (id, assistant, session_id, thread_id, source_key, ts, cwd, \
+         repo, git_branch, model, prompt, response, commands_text, redacted) \
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+        params![
+            &id,
+            &ex.assistant,
+            &ex.session_id,
+            &ex.thread_id,
+            &ex.source_key,
+            ex.ts,
+            &ex.cwd,
+            &ex.repo,
+            &ex.git_branch,
+            &ex.model,
+            &ex.prompt,
+            &ex.response,
+            ex.commands.join("\n"),
+            ex.redacted as i64
+        ],
+    )?;
+    for (i, c) in ex.commands.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO commands (exchange_id, seq, cmd, lang) VALUES (?1,?2,?3,NULL)",
+            params![&id, i as i64, c],
+        )?;
+    }
+    for (i, f) in ex.files.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO file_refs (exchange_id, seq, path, tool) VALUES (?1,?2,?3,'import')",
+            params![&id, i as i64, f],
+        )?;
+    }
+    Ok(Imported::Inserted)
 }

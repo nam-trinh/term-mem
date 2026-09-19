@@ -19,10 +19,10 @@ here to have a local answer.
 | Keyword search | SQLite FTS5, BM25 ranking | In-process, no separate service, good enough to carry the common path |
 | Vector search | `sqlite-vec` extension | Same file, same transaction, no second datastore |
 | Embeddings | `fastembed-rs` / ONNX Runtime, `bge-small-en-v1.5` | Runs locally on CPU, ~130MB, 384 dims |
-| Encryption (opt-in) | SQLCipher (`sqlite3mc`) | Page-level AES on the same file format |
+| Encryption (opt-in) | ~~SQLCipher (`sqlite3mc`)~~ | **Not shipped — Phase 3 found the key, not the cipher, is the problem. See [phases/phase-3.md](phases/phase-3.md) finding 3.** |
 | Capture | Transcript parsing, triggered by file watch or hook; PTY wrapper as fallback | The response is already on disk in structured form |
 | File watching | `notify` (FSEvents/inotify) | Transcript tailing without polling |
-| Redaction | `gitleaks`-style rules + Shannon entropy, pre-write | The archive must never contain the secret in the first place |
+| Redaction | `gitleaks`-style rules pre-write (`regex`); Shannon entropy **opt-in** | The archive must never contain the secret in the first place — but a false positive destroys a mined command line permanently, so the aggressive half is off by default |
 | Agent interface | MCP server over stdio, plus `--json` on a pipe | One protocol for MCP clients, one escape hatch for everything else |
 | Config | TOML at `~/.config/term-mem/config.toml` | Editable by hand, greppable, diffable |
 | Packaging | `cargo-dist`, Homebrew tap, static musl builds | `curl \| sh` and `brew install` with no toolchain |
@@ -157,10 +157,21 @@ delete stick without keeping the secret. This is the one place a tombstone is
 correct, and it was missed in the first Phase 1 commit: see
 [phases/phase-1.md](phases/phase-1.md) finding 9.
 
-**Encryption is opt-in and has a cost the user is told about.** SQLCipher makes
-the file useless to `grep`, `sqlite3`, and every other tool the mission promises
-the user can reach for. That's why `tmem export` is not a nice-to-have: with
-encryption on, the guaranteed open-format export *is* the ownership promise.
+~~**Encryption is opt-in and has a cost the user is told about.**~~ **Not
+shipped, and the reason is the key rather than the cipher.** SQLCipher itself
+works — a scratch build writes a file with no plaintext and no `SQLite format 3`
+header. But the capture hook runs unattended on every turn, so the drainer it
+spawns must open the database with nobody at the keyboard, so the key must live
+somewhere an unattended process can read: a file in the data directory, or the
+environment. Either sits on the same machine, under the same user, beside the
+database. The feature would stop a `.db` file copied *without* its directory and
+almost nothing else, while `status` printed `encrypted yes`. An OS keychain is
+the path that would work and is platform-specific work with a latency cost the
+5 ms hook budget has an opinion about. See
+[phases/phase-3.md](phases/phase-3.md) finding 3.
+
+`tmem export` ships regardless, and `status` states the truth instead:
+`encrypted no (the file is readable with sqlite3 and grep)`.
 
 ---
 
@@ -360,14 +371,26 @@ Between capture and commit, every exchange passes a filter:
 
 1. **Pattern rules** for known-shaped credentials — `sk-…`, `ghp_…`, AWS keys,
    JWTs, `Authorization:` headers, PEM blocks. The `gitleaks` ruleset is the
-   obvious starting corpus.
-2. **Entropy scan** over assignment-shaped tokens, to catch the shapes no rule
-   knows.
+   obvious starting corpus. **On by default; thirteen rules shipped.**
+2. ~~**Entropy scan** over assignment-shaped tokens, to catch the shapes no rule
+   knows.~~ **Implemented, off by default.** Measured against a real archive it
+   produced 38 false positives and zero true positives, then 8, then 3 across
+   three tightenings — every hit a filesystem path or a UUID filename. Because
+   `tool_use` blocks are mined and discarded, a redacted command line cannot be
+   recovered, so a false positive here is permanent data loss and outranks the
+   hypothetical secret it might have caught. `[entropy] enabled = true` in the
+   rule file turns it on. See [phases/phase-3.md](phases/phase-3.md) finding 2.
 3. **Path-based ignore** (`tmem ignore <path>`) evaluated before any of it.
+4. **User rules**, from `~/.config/term-mem/redact.toml` — site-specific
+   hostname and ticket shapes, plus an `email` rule that ships off.
 
 Matches are replaced with `[redacted:aws-key]` and the row is flagged. This is
 prevention; `tmem forget` is the valve for what prevention misses. It is not a
 substitute for having it.
+
+**Every write path redacts, not just transcript ingest.** `tmem import` is the
+second door into the database and runs the same filter — an export may predate
+a rule the user has since added.
 
 Capture then hands off to a background writer so the assistant's exit isn't
 blocked on embedding generation. Latency budget at the hook: **under 5ms** —
@@ -509,7 +532,10 @@ its place only as a formatting helper.
 ## Supporting cast
 
 - **Testing:** unit tests beside the parser and integration tests driving the
-  real binary against a temp database. Phase 1 shipped without `insta` and
+  real binary against a temp database. Phase 3's deletion test reads **every
+  byte of every file in the data directory**, not just `memory.db`: WAL mode
+  keeps recent pages in a separate file, and a secret sitting there is a secret
+  on disk. Phase 1 shipped without `insta` and
   `criterion` — snapshots of CLI output would have locked in formatting that is
   still moving, and the hook budget is a wall-clock measurement over 60 samples
   rather than a benchmark harness. Both are worth revisiting when the surface
@@ -530,6 +556,14 @@ its place only as a formatting helper.
 
 ## Open questions
 
+- **What an encrypted archive does when the key is unavailable.** Refusing to
+  capture is data loss; capturing unencrypted is a lie; prompting is impossible
+  on a hook. Nothing in these docs chooses, and Phase 3 stopped there. Blocking
+  for any future attempt at encryption at rest.
+- **Whether the entropy fallback earns being on by default.** Its false-positive
+  rate is measured (high) and its true-positive rate is not (the archive has
+  never held a credential). A synthetic corpus of real-shaped secrets would
+  settle it.
 - Whether the background writer is a daemon or a spawned-per-capture process. A
   daemon amortizes model loading; a spawned process has no lifecycle to manage
   and nothing to leave running on a user's machine. **Leaning spawned, and

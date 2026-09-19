@@ -35,7 +35,13 @@ This is the constraint everything else is designed around, not a feature bullet.
 - **Deletes are real deletes.** `tmem forget` removes the row, its mined
   commands, its file references and its index entries in one transaction, then
   `VACUUM`s so the text is not recoverable from a free page. There is no
-  `deleted = 1` flag on a row that stays greppable on disk.
+  `deleted = 1` flag on a row that stays greppable on disk. A test reads every
+  byte of every file term-mem wrote, the WAL included, and fails if the secret
+  is in any of them.
+- **Credentials are redacted before they are written**, not after. The archive
+  never contains the secret in the first place.
+- **The archive is not encrypted**, and `tmem status` says so in those words
+  rather than leaving you to guess. See [Status](#status).
 
 ## Install
 
@@ -123,6 +129,51 @@ $ TMEM=0 claude                   # this invocation only
 
 Pause state is always visible in `tmem status`.
 
+### Redaction
+
+Credentials with a recognisable shape — `sk-…`, `ghp_…`, AWS and GCP keys, JWTs,
+`Authorization:` headers, PEM blocks — are replaced *before* anything reaches
+the disk. The replacement names the rule, the row is flagged, and capture says
+so out loud:
+
+```console
+$ tmem capture --all
+12 new, 0 updated, from 3 transcript(s) (0 unchanged)
+  redacted: 1 exchange(s) — github-token, aws-access-key ×2
+```
+
+Site-specific shapes go in `~/.config/term-mem/redact.toml`:
+
+```toml
+[[rule]]
+name = "internal-host"
+pattern = '\b[a-z0-9-]+\.corp\.internal\b'
+```
+
+A rule that does not compile stops capture rather than quietly not running.
+
+**The entropy fallback is off by default.** It catches high-entropy values that
+no pattern rule knows — and measured against a real archive, every single thing
+it caught was a filesystem path or a UUID filename. Because mined command lines
+are the only copy that exists, a false positive is permanent data loss. Turn it
+on with `[entropy] enabled = true` if your archive is shaped differently.
+
+Redaction is prevention, not a guarantee. `forget` is the valve for what it
+misses.
+
+### Owning the data
+
+```console
+$ tmem export --json > backup.jsonl
+$ tmem export --markdown > archive.md
+$ tmem export --json --repo > this-project.jsonl
+$ tmem import backup.jsonl
+```
+
+Export writes the whole archive, not the first page — `-n` is honoured only when
+you ask for it. Import is keyed the same way capture is, so it is idempotent, it
+redacts on the way in, and it will not resurrect anything you deleted.
+
 ### Deleting
 
 The safety valve, for when you realise afterwards that you pasted something you
@@ -169,17 +220,23 @@ capture, browse, keyword search, capture control, and deletion.
 | Phase 0 — prove the premise | done |
 | Phase 1 — capture and browse | done |
 | Phase 2 — keyword recall | done |
-| Phase 3 — redaction, and honest deletion | next |
-| Phase 4 — reuse (MCP server, tool schemas) | |
+| Phase 3 — redaction, and honest deletion | done (4 of 6 items) |
+| Phase 4 — reuse (MCP server, tool schemas) | next |
 | Phase 5 — semantic recall, if the archive says it is needed | |
 | Phase 6 — Codex CLI, aider, and other assistants | |
 
-**Redaction does not exist yet.** Until Phase 3, an archive contains whatever
-you pasted into your assistant, including credentials. `tmem forget` is the
-valve; `tmem ignore` keeps a tree out entirely.
+**Two things Phase 3 did not ship, stated plainly:**
+
+- **There is no encryption at rest.** SQLCipher works; the key management does
+  not. An unattended capture hook needs a key it can read without you, which
+  puts the key beside the database it protects — so the feature would stop
+  almost nothing while claiming otherwise. The file is an ordinary SQLite
+  database and `tmem status` says so.
+- **The entropy fallback is off**, for the reason under
+  [Redaction](#redaction).
 
 Measured, not assumed: capture costs p95 **2.9 ms** at the turn boundary, and a
-cold query against a 100,000-exchange archive returns in p95 **17.9 ms**.
+cold query against a 100,000-exchange archive returns in p95 **19.3 ms**.
 
 ## The documentation is the specification
 

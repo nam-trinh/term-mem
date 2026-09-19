@@ -90,7 +90,7 @@ pub fn search(conn: &Connection, terms: &[String], filter: &Filter) -> Result<Ve
     // returns the best two matches in that repo, not the ones that survived the
     // global top twenty.
     let sql = format!(
-        "SELECT e.id, e.assistant, e.session_id, e.thread_id, e.ts, e.cwd, e.repo, \
+        "SELECT e.id, e.assistant, e.session_id, e.thread_id, e.source_key, e.ts, e.cwd, e.repo, \
                 e.git_branch, e.model, e.prompt, e.response, e.redacted, \
                 -bm25(exchanges_fts, {W_PROMPT}, {W_RESPONSE}, {W_COMMANDS}) AS score, \
                 snippet(exchanges_fts, -1, '{HL_OPEN}', '{HL_CLOSE}', '…', 24) AS snippet \

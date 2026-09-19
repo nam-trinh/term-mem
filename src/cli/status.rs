@@ -47,14 +47,22 @@ pub fn status() -> Result<i32> {
             crate::output::fmt_date(nw)
         );
     }
-    // docs/plan.md Phase 3: the redaction count is visible here, because silent
+    // docs/plan.md: the redaction count is visible here, because silent
     // redaction leaves the user unable to tell a mangled response from a bad one.
-    println!("  redacted    {redacted}   (redaction lands in Phase 3)");
+    let rules_path = crate::redact::user_rules_path()?;
+    println!(
+        "  redacted    {redacted} exchange(s){}",
+        if rules_path.exists() {
+            format!("   (rules: {})", tilde(&rules_path.to_string_lossy()))
+        } else {
+            String::new()
+        }
+    );
     let forgotten = queries::forgotten_count(&conn)?;
     if forgotten > 0 {
         println!("  forgotten   {forgotten}   (kept as keys only, so re-ingest cannot undo it)");
     }
-    println!("  encrypted   no    (opt-in encryption lands in Phase 3)");
+    println!("  encrypted   {}", crate::db::encryption_status(&db_path));
 
     // Pause state must be visible.
     match pause::state()? {
@@ -116,6 +124,24 @@ pub fn doctor() -> Result<i32> {
         problems += bad("`tmem` is not on PATH — the hook fires but cannot find the binary");
     } else {
         ok("`tmem` resolves on PATH");
+    }
+
+    // A rule file that does not compile aborts ingest — correctly, because
+    // capturing unredacted would be worse. But the drainer is detached with its
+    // stderr discarded, so the user sees capture stop and nothing say why.
+    // `doctor` is the command whose whole job is answering that.
+    let rules_path = crate::redact::user_rules_path()?;
+    match crate::redact::Redactor::load() {
+        Ok(_) if rules_path.exists() => ok(&format!(
+            "redaction rules load from {}",
+            tilde(&rules_path.to_string_lossy())
+        )),
+        Ok(_) => ok("redaction rules load (no user rule file)"),
+        Err(e) => {
+            problems += bad(&format!(
+                "redaction rules will not load, so capture cannot run: {e:#}"
+            ));
+        }
     }
 
     let root = paths::claude_projects_dir()?;

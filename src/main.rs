@@ -1,6 +1,7 @@
 //! term-mem — a local memory layer for terminal AI conversations.
 //!
-//! Phase 2: capture, browse, and keyword recall. See docs/plan.md.
+//! Phase 3: capture, browse, keyword recall, redaction and honest
+//! deletion. See docs/plan.md.
 //!
 //! There is no network code in this binary, by design and by promise. See
 //! docs/mission.md: nothing leaves the machine.
@@ -10,6 +11,7 @@ mod cli;
 mod db;
 mod output;
 mod paths;
+mod redact;
 mod search;
 
 use clap::{Parser, Subcommand};
@@ -114,6 +116,19 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         remove: Option<PathBuf>,
     },
+    /// Write the archive out in an open format
+    ///
+    /// JSON by default — `--json` is accepted and means the same thing, so the
+    /// form in docs/cli.md (`tmem export --json | --markdown`) works as printed.
+    Export {
+        /// Human-readable markdown instead of JSON
+        #[arg(long)]
+        markdown: bool,
+        #[command(flatten)]
+        browse: cli::BrowseArgs,
+    },
+    /// Read exchanges back in from an export
+    Import { path: PathBuf },
     /// Permanently delete an exchange
     Forget {
         id: Option<String>,
@@ -167,6 +182,15 @@ fn run() -> anyhow::Result<i32> {
             quiet,
         } => cli::capture_cmd::run(hook, drain, path, all, quiet),
         Command::Search { query, browse } => cli::search::run(&query, &browse),
+        Command::Export { markdown, browse } => {
+            let format = if markdown {
+                cli::export::Format::Markdown
+            } else {
+                cli::export::Format::Json
+            };
+            cli::export::export(format, &browse)
+        }
+        Command::Import { path } => cli::export::import(&path),
         Command::Recent { browse } => cli::show::list(&browse),
         Command::Log { browse } => cli::show::list(&browse),
         Command::Show { id, session, json } => cli::show::show(&id, session, json),

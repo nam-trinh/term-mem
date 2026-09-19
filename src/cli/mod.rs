@@ -1,4 +1,5 @@
 pub mod capture_cmd;
+pub mod export;
 pub mod forget;
 pub mod ignore;
 pub mod init;
@@ -26,9 +27,13 @@ pub struct BrowseArgs {
     /// Limit to the current git repository
     #[arg(long)]
     pub repo: bool,
-    /// Maximum results
-    #[arg(long, short = 'n', default_value_t = 20)]
-    pub limit: usize,
+    /// Maximum results [default: 20]
+    ///
+    /// An `Option` rather than a defaulted value so that `export` can tell "the
+    /// user asked for 20" from "nobody said": handing someone a twentieth of
+    /// their history and calling it a backup is the failure worth avoiding.
+    #[arg(long, short = 'n')]
+    pub limit: Option<usize>,
     /// Machine-readable output, one JSON record per line
     #[arg(long)]
     pub json: bool,
@@ -50,6 +55,12 @@ pub fn in_path_candidates(p: &std::path::Path) -> Vec<String> {
 }
 
 impl BrowseArgs {
+    pub const DEFAULT_LIMIT: usize = 20;
+
+    pub fn limit_was_given(&self) -> bool {
+        self.limit.is_some()
+    }
+
     pub fn to_filter(&self) -> Result<Filter> {
         let in_paths = self
             .in_path
@@ -69,7 +80,7 @@ impl BrowseArgs {
             in_paths,
             since_ms: self.since.as_deref().map(timespec::parse).transpose()?,
             repo,
-            limit: Some(self.limit),
+            limit: Some(self.limit.unwrap_or(Self::DEFAULT_LIMIT)),
         })
     }
 }
