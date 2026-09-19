@@ -25,7 +25,7 @@ pub struct Exchange {
     pub files: Vec<String>,
 }
 
-fn row_to_exchange(row: &Row) -> rusqlite::Result<Exchange> {
+pub fn row_to_exchange(row: &Row) -> rusqlite::Result<Exchange> {
     Ok(Exchange {
         id: row.get("id")?,
         assistant: row.get("assistant")?,
@@ -67,17 +67,23 @@ pub fn hydrate(conn: &Connection, rows: &mut [Exchange]) -> Result<()> {
 /// Browse filters. Phase 1 has no text query; these are the whole surface.
 #[derive(Default, Debug, Clone)]
 pub struct Filter {
-    pub in_path: Option<String>,
+    /// Candidate spellings of one `--in` tree. A path can reach the archive in
+    /// more than one form — on macOS `/var/…` and `/private/var/…` name the
+    /// same directory — and the stored `cwd` is whatever the assistant wrote,
+    /// not whatever the user types later. Matching any of them is the
+    /// difference between a filter that works and one that silently returns
+    /// nothing, which is the failure docs/scenarios.md warns about.
+    pub in_paths: Vec<String>,
     pub since_ms: Option<i64>,
     pub repo: Option<String>,
     pub limit: Option<usize>,
 }
 
 impl Filter {
-    fn clauses(&self) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+    pub fn clauses(&self) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
         let mut sql = String::new();
         let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        if let Some(p) = &self.in_path {
+        if !self.in_paths.is_empty() {
             // Prefix match on the directory tree, with the separator appended so
             // `--in ~/src/api` does not also match `~/src/api-legacy`.
             //
@@ -87,12 +93,16 @@ impl Filter {
             // nothing and looks like the archive lost the exchange, which is the
             // exact failure docs/scenarios.md warns about. `LIKE` is no better;
             // it is also ASCII-case-insensitive, and paths are not.
-            let dir = p.trim_end_matches('/');
-            let prefix = format!("{dir}/");
-            sql.push_str(" AND (cwd = ? OR substr(cwd, 1, ?) = ?)");
-            args.push(Box::new(dir.to_string()));
-            args.push(Box::new(prefix.chars().count() as i64));
-            args.push(Box::new(prefix));
+            let mut ors = Vec::new();
+            for p in &self.in_paths {
+                let dir = p.trim_end_matches('/');
+                let prefix = format!("{dir}/");
+                ors.push("cwd = ? OR substr(cwd, 1, ?) = ?");
+                args.push(Box::new(dir.to_string()));
+                args.push(Box::new(prefix.chars().count() as i64));
+                args.push(Box::new(prefix));
+            }
+            sql.push_str(&format!(" AND ({})", ors.join(" OR ")));
         }
         if let Some(t) = self.since_ms {
             sql.push_str(" AND ts >= ?");

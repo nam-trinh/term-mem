@@ -450,17 +450,17 @@ fn status_counts_what_is_there() {
         .stdout(predicate::str::contains("capture     ON"));
 }
 
-/// docs/cli.md makes search the default verb, but it lands in Phase 2. Saying
-/// so is the point: an empty result would look like a lost exchange.
+/// docs/cli.md makes search the default verb. Phase 1 answered a bare query
+/// with "search lands in Phase 2"; this is the same test, inverted.
 #[test]
-fn a_bare_query_says_search_is_not_here_yet() {
+fn a_bare_query_searches() {
     let e = Env::new();
     e.ingest("finding-09-many-to-one.jsonl");
     e.cmd()
         .args(["ffmpeg", "concat"])
         .assert()
-        .code(2)
-        .stderr(predicate::str::contains("Phase 2"));
+        .success()
+        .stdout(predicate::str::contains("ffmpeg"));
 }
 
 #[test]
@@ -724,10 +724,13 @@ fn tilde_only_collapses_at_a_path_boundary() {
         .stdout(predicate::str::contains("~/sub"));
 }
 
-/// `ignore` advertised `forget --in`, which does not exist until Phase 2.
+/// Phase 1 shipped `ignore` advertising `forget --in`, which then exited 2.
+/// The rule the regression test encodes is not "name the phase" but "whatever
+/// the output tells the user to run must actually run".
 #[test]
-fn ignore_does_not_advertise_a_flag_that_does_not_exist() {
+fn ignore_only_advertises_commands_that_work() {
     let e = Env::new();
+    e.ingest("finding-09-many-to-one.jsonl");
     let out = e
         .cmd()
         .args(["ignore", "/home/dev/talks"])
@@ -735,13 +738,12 @@ fn ignore_does_not_advertise_a_flag_that_does_not_exist() {
         .success();
     let s = String::from_utf8(out.get_output().stdout.clone()).unwrap();
     assert!(
-        s.contains("Phase 2"),
-        "the phase it arrives in should be named"
+        s.contains("tmem forget --in"),
+        "the deletion path should be named: {s}"
     );
-    // Whatever it suggests must actually run.
+    assert!(!s.contains("Phase 2"), "it is no longer a future flag: {s}");
     e.cmd()
-        .args(["forget", "--in", "/home/dev/talks"])
+        .args(["forget", "--in", "/home/dev/talks", "-y"])
         .assert()
-        .code(2);
-    assert!(!s.contains("use `tmem forget --in"));
+        .success();
 }

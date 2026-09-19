@@ -1,9 +1,9 @@
 # term-mem — CLI surface
 
-Status: Phase 1 shipped, so the browse and capture-control halves of this
-document are now *as implemented* rather than as sketched; search and everything
-downstream of it are still design. Anything not yet built is marked with the
-phase that owns it.
+Status: Phases 1 and 2 shipped, so searching, browsing, capture control and
+deletion are all now *as implemented* rather than as sketched. Data ownership
+(`export`/`import`) and everything downstream of it are still design. Anything
+not yet built is marked with the phase that owns it.
 
 ## Name
 
@@ -42,9 +42,11 @@ nothing and removes a ritual from the hot path.
 `tmem search <query>` remains available as the explicit form, for scripts and
 for queries that collide with a subcommand name.
 
-**Phase 2.** Until then a bare query exits `2` and says where search is, rather
-than printing an empty result — which would be indistinguishable from an archive
-that had lost the exchange.
+A query that matches nothing exits `1` and names the browse commands, rather
+than printing an empty list — an empty list is indistinguishable from an archive
+that had lost the exchange. A query with no searchable terms in it at all
+(`tmem search ---`) exits `2`, because that is a different thing from finding
+nothing.
 
 **This constrains the subcommand list.** Every reserved word is a query that
 behaves surprisingly. Keep the set small, stable, and made of words nobody
@@ -54,19 +56,28 @@ searches for.
 
 ### Searching
 
-*Phase 2.*
-
 ```
 tmem <query>                    search everything
 tmem <query> --in <path>        limit to a directory tree
 tmem <query> --since <when>     limit by time
 tmem <query> --repo             limit to the current git repo
 tmem <query> --json             machine-readable, for piping
+tmem <query> -n <count>         how many results (default 20)
 ```
 
 Metadata filters carry real weight here. Constraining by where and when you were
 collapses the search space before the text query runs, and recovers much of what
 would otherwise need semantic search.
+
+Flags may come before or after the query terms — `tmem backfill --repo --since
+january` is the form scenarios.md types, and it works. The cost is that a query
+term beginning with `-` needs `tmem search -- <term>`.
+
+Ranking is BM25 with the command lines weighted well above prose. It orders
+results *within* a filtered set; it is not a way of telling two similar
+exchanges apart, and where two rows match a single term equally the shorter one
+wins. See [phases/phase-2.md](phases/phase-2.md) finding 2 — the filters are the
+lever, and the ranking is the part the roadmap expects to replace.
 
 ### Browsing
 
@@ -80,10 +91,13 @@ tmem show <id>                  one exchange, in full
 tmem show <id> --session        the surrounding conversation (thread, not file)
 ```
 
-`recent` and `log` share the metadata filters — `--in`, `--since`, `--repo`,
-`--json`, and `-n/--limit` (default 20) — and differ only in intent; both order
-newest first. `--in` matches a directory tree exactly, so `--in ~/src/api` does
-not also match `~/src/api-legacy`. `--since` takes `2h`, `7d`, `3w`,
+`recent`, `log` and search share the metadata filters — `--in`, `--since`,
+`--repo`, `--json`, and `-n/--limit` (default 20); `recent` and `log` differ only
+in intent and both order newest first. `--in` matches a directory tree exactly,
+so `--in ~/src/api` does not also match `~/src/api-legacy`, and it matches a tree
+under every name the filesystem gives it — on macOS `/var/folders/…` and
+`/private/var/folders/…` are the same directory, and the archive holds whichever
+one the assistant recorded. `--since` takes `2h`, `7d`, `3w`,
 `2 hours ago`, `today`, `yesterday`, or `2026-03-01`; anything else is an error
 rather than a silent fallback to the epoch, which would return the whole archive
 and look like it worked.
@@ -115,7 +129,7 @@ opening SQLite to ask would not fit the latency budget. They are greppable and
 hand-editable, like everything else the user owns.
 
 `ignore` affects capture from that point on; it does not retroactively delete.
-The command says so, and points at `forget --in` for that — which is Phase 2.
+The command says so, and points at `forget --in` for that.
 
 **Pause state must be visible.** A user who believes it's recording when it's
 paused loses work; one who believes it's paused when it's recording gets a nasty
@@ -130,11 +144,16 @@ The real safety valve. People realize *after* the fact that they pasted a
 credential or discussed something sensitive:
 
 ```
-tmem forget --last              Phase 1
-tmem forget <id>                Phase 1
-tmem forget --since '1 hour ago'    Phase 2
-tmem forget --in <path>             Phase 2
+tmem forget --last
+tmem forget <id>
+tmem forget --since '1 hour ago'
+tmem forget --in <path>
 ```
+
+`--since` and `--in` select a set and cannot be combined with an id or `--last`;
+mixing them is an error rather than a guess, because guessing wrong on this
+command deletes more than was asked for. The confirmation lists the rows, not a
+count — a number is not something a person can check.
 
 `forget` confirms interactively and takes `-y`/`--yes` to skip that. The prompt
 is gated on *stdin* being a terminal, not stdout, so `tmem forget <id> | tee log`
@@ -145,6 +164,8 @@ file afterwards.
 
 It also records the deleted exchange's dedup key, and only that, so the next
 ingest of the same transcript does not put it back. `status` shows the count.
+The search index needs no mention here because it is maintained by triggers on
+the row: a delete that reaches `exchanges` has already reached `exchanges_fts`.
 
 These are genuine deletes, including from the search index — never a hidden
 flag on a row that stays on disk.

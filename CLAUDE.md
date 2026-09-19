@@ -29,17 +29,22 @@ roadmap is the opt-in model download in Phase 5, behind `tmem embed --enable`.
   later — the raw `tool_use` block is never stored.
 - **Silent failure is the enemy.** Ingest prefers a loud error, or a
   counted-and-reported skip, over a best-effort guess. Most traps found so far
-  produce a plausible-looking archive that is wrong.
+  produce a plausible-looking archive that is wrong. A counter is not immunity:
+  Phase 2 finding 1 is a case where the honest report of what ingest dropped was
+  read as a fact about the format for a whole phase.
 
 ## Build, test, lint
 
 ```
 cargo build && cargo test && cargo clippy --all-targets && cargo fmt --check
-cargo test --release --test budget -- --nocapture    # the measured hook budget
+cargo test --release --test budget -- --nocapture    # measured budgets
 ```
 
-Unit tests sit beside the code; `tests/` drives the real binary against a temp
-database. Fixtures are in `tests/fixtures/<adapter>/` — real record *shapes*,
+The budget suite is release-only and slow: it measures the hook at the turn
+boundary (< 5 ms) and a cold query against a generated 100k-exchange archive
+(p95 < 100 ms), which it builds by ingesting transcripts through the real
+parser. Unit tests sit beside the code; `tests/` drives the real binary against
+a temp database, and `tests/search.rs` runs scenarios 1 and 2 verbatim. Fixtures are in `tests/fixtures/<adapter>/` — real record *shapes*,
 synthetic content, one per finding in `docs/phases/`. `TMEM_HOME`,
 `TMEM_CLAUDE_PROJECTS` and `TMEM_CLAUDE_SETTINGS` redirect the data directory
 and transcript tree; use them for anything run by hand.
@@ -48,7 +53,11 @@ and transcript tree; use them for anything run by hand.
 
 `src/main.rs` dispatch · `src/cli/` one module per subcommand · `src/db/` schema
 and forward-only refinery migrations · `src/capture/` ingest, hook queue, and
-`adapters/` · `src/output.rs` pipe detection, exit codes, formatting.
+`adapters/` · `src/search/` FTS5 match building and BM25 ranking ·
+`src/output.rs` pipe detection, exit codes, formatting.
+
+`exchanges_fts` is maintained by triggers on `exchanges`, not by the write path.
+Anything that changes a row updates the index without knowing it exists.
 
 Adapters declare their own dedup key and injected-block vocabulary; neither is
 universal — see `src/capture/adapters/mod.rs` and

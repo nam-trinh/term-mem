@@ -106,7 +106,19 @@ boundary is in the user's way by construction. **Measured: p95 2.35 ms**, and
 
 ---
 
-## Phase 2 — Keyword recall
+## Phase 2 — Keyword recall ✅
+
+**Done 2026-09-06 — [phases/phase-2.md](phases/phase-2.md).** Verdict: the scope
+ships and the query budget is met with room. The ranking was the easy half. The
+hard half was that the archive being ranked was missing 42% of itself: Phase 1's
+carried-forward suspicion that resumed sessions omit their prompts was wrong —
+the prompts were always in the transcript, and Phase 1's own discriminator was
+rejecting them because the editor prepends `<ide_opened_file>` to the record
+that carries the question. Fixing it takes the orphan count from 21 records
+(19 KB) to zero. Two design claims did not survive: `tech-stack.md`'s
+`exchanges_fts` cannot be created as written (finding 4), and scenario 2's "the
+first is the one" is contradicted by BM25's length normalisation (finding 2),
+which is a defect in the scenario rather than in the ranking.
 
 *Scenario 1 works end to end.*
 
@@ -138,7 +150,11 @@ all three scenarios lean on. No embeddings, no fusion, nothing to configure.
 carries the browse half of scenario 2 (`log --in`, `show --session`); what is
 missing is every line that begins `tmem <query>`. p95 query
 latency under 100ms on 100k exchanges — generate the synthetic archive to prove
-it rather than waiting to be surprised in year two.
+it rather than waiting to be surprised in year two. **Scenario 1 runs verbatim;
+scenario 2 runs verbatim except for one ordering sentence, corrected in
+[scenarios.md](scenarios.md) rather than coded around. p95 measured on a
+generated 100k-exchange archive — see [phases/phase-2.md](phases/phase-2.md)
+finding 5.**
 
 **Deliberately not:** semantic search. If scenario 1 needs embeddings to work,
 the tokenizer is wrong and adding vectors would hide that.
@@ -162,7 +178,11 @@ produced evidence about what a real archive contains. This phase acts on it.
   site-specific and no shipped ruleset will guess them.
 - Deletion audited end to end: row, FTS entries, command rows, snippet cache,
   and `VACUUM`, so a deleted secret is genuinely not on disk. Test it by
-  grepping the raw database file after a `forget`.
+  grepping the raw database file after a `forget`. **Partly done: Phase 2 put
+  the FTS index behind triggers on `exchanges`, so a delete that reaches the row
+  reaches the index, and the grep-the-file test passes today for `--last`,
+  `<id>`, `--since` and `--in`.** What Phase 3 adds is the adversarial version
+  of it and the artifacts that do not exist yet.
 - Opt-in encryption at rest (SQLCipher), which is also the moment `export`
   stops being a nicety: an encrypted file isn't greppable, so the open-format
   export is what keeps the ownership promise true.
@@ -241,6 +261,13 @@ duplicate event stream that double-counts every response if ingested naively.
 - Generalize the parser interface first, so each adapter declares its own dedup
   key and its own injected-block vocabulary. Phase 1's interface was designed
   against a sample of one and assumes both are universal. They aren't.
+- **Subagent transcripts, which are a Claude Code adapter gap rather than a new
+  vendor.** Phase 2 found them in `<project>/<session>/subagents/agent-*.jsonl`
+  — a directory nothing looks in, which is why Phases 0 and 1 both recorded
+  "zero sidechain records". Their root is a `user` record with `isMeta: true`
+  holding the agent's instructions, so the inline-`isSidechain` shape the parser
+  was built for may not be the shape that occurs. See
+  [phases/phase-2.md](phases/phase-2.md) finding 3.
 - Then Codex CLI, then aider, then the rest — each with checked-in fixtures.
 
 The PTY wrapper (`tmem run <assistant>`) lands here as the explicitly lossy last
