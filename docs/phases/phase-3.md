@@ -191,6 +191,13 @@ Search, 100,000 exchanges:
   filtered                 p50 13.55 ms  p95 13.81 ms     (budget 100 ms)
 ```
 
+Both are release numbers, and as of this phase only a release build asserts on
+them: `cargo test` still runs the measurement and prints it, but a debug binary
+is ~3x slower — search p95 ~40 ms and hook p95 ~4.6 ms against a 5 ms
+budget — so enforcing there was a gate that failed whenever the machine was
+busy. It failed once on `main` immediately after this phase merged, which is
+how it was found.
+
 Redaction is in the ingest path, not the hook, so the turn boundary is
 untouched by construction. Its own cost shows up in the budget suite's archive
 build: 12 s before this phase, 15 s after, for 100,000 exchanges — roughly
