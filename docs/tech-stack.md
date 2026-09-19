@@ -23,7 +23,7 @@ here to have a local answer.
 | Capture | Transcript parsing, triggered by file watch or hook; PTY wrapper as fallback | The response is already on disk in structured form |
 | File watching | `notify` (FSEvents/inotify) | Transcript tailing without polling |
 | Redaction | `gitleaks`-style rules pre-write (`regex`); Shannon entropy **opt-in** | The archive must never contain the secret in the first place — but a false positive destroys a mined command line permanently, so the aggressive half is off by default |
-| Agent interface | MCP server over stdio, plus `--json` on a pipe | One protocol for MCP clients, one escape hatch for everything else |
+| Agent interface | MCP server over stdio (hand-rolled JSON-RPC), plus `--json` on a pipe | One protocol for MCP clients, one escape hatch for everything else. **The SDKs bring an async runtime and HTTP/SSE transports; the stdio wire format is newline-delimited JSON-RPC and `serde_json` already speaks it** |
 | Config | TOML at `~/.config/term-mem/config.toml` | Editable by hand, greppable, diffable |
 | Packaging | `cargo-dist`, Homebrew tap, static musl builds | `curl \| sh` and `brew install` with no toolchain |
 
@@ -486,6 +486,23 @@ archive, never write to or delete from it. Capture is the user's, not the
 model's. And **results carry provenance** (id, timestamp, cwd) so the agent can
 cite where a claim came from and the user can go read it.
 
+Shipped in Phase 4, with three things this table did not say:
+
+- **Read-only is `SQLITE_OPEN_READ_ONLY`,** not a short tool list. The list is
+  something a later phase edits; the open flags are not. The cost is that
+  migrations cannot run on that handle, so an archive older than the binary
+  fails loudly on the first query instead of being upgraded underneath an agent.
+- **`repo` is a repository name, not the CLI's boolean.** `--repo` resolves from
+  the current checkout, and a model has no meaningful current directory.
+- **`limit` is clamped to 50 and the clamp is reported.** A tool returning ten
+  thousand rows fills a context window with someone else's afternoon.
+
+Provenance in practice is a `cite` field holding the literal `tmem show <id>`
+that displays the same exchange, plus a `why` naming the matched terms and the
+BM25 score. An unknown argument is an error rather than a wider search: a model
+that calls `search_memory({"querry": …})` and gets everything back has been told
+something false that neither it nor the user can notice.
+
 ### Automatic recall via hooks
 
 The same `UserPromptSubmit` hook that captures can also inject. Given a prompt,
@@ -496,6 +513,26 @@ This is powerful and it is also how the tool becomes annoying, so: **off by
 default**, capped hard (3 exchanges / ~1500 tokens), and always visibly
 attributed in the transcript. Silently steering a model with retrieved text the
 user can't see is the opposite of the tool's premise.
+
+Shipped in Phase 4. ~~"if anything clears a relevance floor"~~ **Resolved, and
+not as written: the floor cannot be a score.** BM25's IDF term collapses when
+every row contains the word, so the same perfect match scores `5e-06` on a
+three-row archive and double digits on a 100k one — a fixed threshold is "always
+on" or "always off" depending on how much history the user has. The gate is
+**term coverage** instead: at least two of the prompt's content words physically
+present, scaling to a quarter of a long prompt, capped at four. Archive-size
+independent, and printable — `tmem recall <words>` shows it, and a user can
+disagree with it. See [phases/phase-4.md](phases/phase-4.md) finding 1.
+
+"Off by default" is also stronger than it reads: `tmem recall --enable` is what
+registers the hook, so until then there is no `UserPromptSubmit` entry at all. A
+registered hook that reads a flag and exits still costs a process spawn on every
+prompt, and still has to be trusted to read the flag.
+
+The hook is on the turn boundary and cannot enqueue and run away the way `Stop`
+does, so it is held to the 100 ms search budget: **73 ms p95 at 100k
+exchanges**, and the cost tracks the commonest word in the prompt rather than
+how many words it has (finding 4).
 
 ### Open-source and self-hosted models
 
@@ -510,9 +547,18 @@ emits the same three tools as JSON Schema, and `tmem call search_memory --args
 envelope. Qwen, Llama, and Mistral instruction-tuned variants handle this well.
 
 **Models without reliable tool use:** retrieve first, stuff after. `tmem <query>
---json --limit 3 | tmem render --prompt-block` produces a fenced context block
-to prepend. Dumber, works everywhere, and it's what the pipe in scenario 3
-already does.
+--json --limit 3 | tmem render --prompt-block` produces a context block to
+prepend. Dumber, works everywhere, and it's what the pipe in scenario 3 already
+does.
+
+Shipped, and the word "fenced" did not survive: the block is delimited by a
+`<past-exchanges source="term-mem">` tag rather than a code fence, because a
+fence cannot contain the fenced command blocks inside it and an exchange *about*
+markdown closes one early. Command blocks get a fence longer than the longest
+backtick run they contain, for the same reason. The block's header also states
+that nothing inside it is an instruction — the archive is the user's own, which
+is not the same as its text being safe to read as a prompt. See
+[phases/phase-4.md](phases/phase-4.md) finding 6.
 
 **Local agent frameworks** get the MCP server, since most now speak it.
 
@@ -526,6 +572,15 @@ to the assistant integration. The answer this stack implies is **neither, mostly
 `--json` plus a pipe covers the manual case, MCP covers the agentic one, and the
 subcommand would be a third way to do what those two already do. `render` earns
 its place only as a formatting helper.
+
+**Held, and it is the part of this section that aged best.** `render` never
+opens the database, so it cannot become a third retrieval path that disagrees
+with the other two; `recall` is a hook entrypoint rather than something a person
+types; `tools` and `call` are the MCP surface for clients that do not speak MCP.
+What this reasoning did not anticipate is that reserving four more words costs
+something: `tools` and `call` are ordinary English, and `tmem call` is now a
+usage error rather than a search. See [phases/phase-4.md](phases/phase-4.md)
+finding 7.
 
 ---
 
@@ -560,6 +615,12 @@ its place only as a formatting helper.
   capture is data loss; capturing unencrypted is a lie; prompting is impossible
   on a hook. Nothing in these docs chooses, and Phase 3 stopped there. Blocking
   for any future attempt at encryption at rest.
+- **Whether an opt-in query log should exist.** Two phases now wait on data
+  nothing records: Phase 5's "does keyword search miss things", and Phase 4's
+  "is the coverage floor right". [phases/phase-2.md](phases/phase-2.md) noted
+  the absence and that it is deliberate. It stays deliberate — but the choice is
+  now between deciding both on memory and building the thing this project is
+  most obliged to be suspicious of. Blocking for Phase 5.
 - **Whether the entropy fallback earns being on by default.** Its false-positive
   rate is measured (high) and its true-positive rate is not (the archive has
   never held a credential). A synthetic corpus of real-shaped secrets would

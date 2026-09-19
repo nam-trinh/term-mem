@@ -220,7 +220,22 @@ fire and `forget` is the valve, tested the same way.
 
 ---
 
-## Phase 4 — Reuse
+## Phase 4 — Reuse ✅
+
+**Done 2026-09-20 — [phases/phase-4.md](phases/phase-4.md).** Verdict: all four
+scope items ship and the Exit criterion is met on every path — MCP, `tools`/
+`call`, the `--json | render` pipe, and the opt-in hook. One design claim did
+not survive: this document asks automatic recall to fire when something "clears
+a relevance floor", and a BM25 score cannot be one. Its IDF term collapses when
+every row contains the word, so a perfect match scores `5e-06` on a three-row
+archive and double digits on a 100k one — the implementation passed its unit
+tests and then recalled nothing at all from a real fixture. **Term coverage
+replaced it**: two of the prompt's content words present, scaling to a quarter
+of a long prompt, capped at four. Archive-size independent, and a sentence a
+user can disagree with. The other surprise is the hook's latency, which tracks
+the commonest word in the prompt rather than how many words it has (73 ms p95 at
+100k exchanges, against the 100 ms search budget) — see
+[phases/phase-4.md](phases/phase-4.md) finding 4.
 
 *The third pillar. Memory goes back into a live session.*
 
@@ -234,17 +249,41 @@ something argues otherwise.
 
 - `tmem mcp` over stdio: `search_memory`, `get_exchange`, `recent`. Read-only,
   provenance attached to every result. Agents read memory; they never write or
-  delete it.
+  delete it. **Shipped, with read-only as a file handle rather than a rule** —
+  `SQLITE_OPEN_READ_ONLY`, so a tool added later inherits the guarantee without
+  anyone remembering to. The JSON-RPC is hand-rolled: the maintained MCP crates
+  bring an async runtime and HTTP/SSE transports into a binary whose whole pitch
+  is that it opens no sockets.
 - `tmem tools --schema openai` and `tmem call <tool>`, so a local model behind
   Ollama, llama.cpp, or vLLM reaches the same three tools without MCP.
+  **Shipped**, from the same tool definitions, so the two envelopes cannot come
+  to disagree about the archive.
 - `tmem render --prompt-block` for models without reliable tool use — the
   `--json | render` pipe from scenario 3, formalized only as formatting.
+  **Shipped, and "only formatting" turned out to include deciding how the text
+  is framed** — the block declares itself as reference material rather than
+  instructions, because the user's own history is a prompt-injection channel
+  with a six-month fuse. See [phases/phase-4.md](phases/phase-4.md) finding 6.
 - Optional `UserPromptSubmit` automatic recall: **off by default**, capped at 3
   exchanges and ~1500 tokens, and always visibly attributed. Memory injected
   invisibly is indistinguishable from the model hallucinating confidently.
+  **Shipped. Off by default means no hook is registered at all** — `tmem recall
+  --enable` is what writes it, because a hook that fires and declines still
+  costs a process spawn on every prompt and still has to be trusted to read its
+  own flag. The relevance floor is the one thing that changed shape; finding 1.
 
 **Exit:** a new session answers from a past exchange, and the user can see
-exactly which one and why it was chosen.
+exactly which one and why it was chosen. **Met on all four paths, tested in
+`tests/reuse.rs` against the real binary. The "why" is met narrowly and
+honestly**: the tool reports which terms matched, what BM25 scored, and how many
+of the prompt's words are present. For a keyword ranker that is the whole of
+the answer, and finding 1 is what happens when you try to build a threshold on
+top of it.
+
+**Budget:** none was stated, which was an omission — the recall hook sits on the
+turn boundary exactly as the `Stop` hook does, and unlike that one it cannot
+enqueue and run away. It is held to the 100 ms search budget and **measured at
+73 ms p95 on 100k exchanges**.
 
 ---
 
@@ -254,6 +293,14 @@ exactly which one and why it was chosen.
 
 By this point there are months of real queries. The question "does keyword
 search miss things" has an answer from data instead of intuition.
+
+**Except that nothing records one.** [phases/phase-2.md](phases/phase-2.md)
+noted that no query is logged and that this is deliberate; Phase 4 added a
+second decision waiting on the same absent data, because whether automatic
+recall's coverage floor is right is also a question only a log could answer. If
+this phase is to be decided on evidence rather than memory, an opt-in query log
+has to land before it — and it is exactly the kind of feature this project
+should be suspicious of, which is why it is named here rather than assumed.
 
 **Scope**
 

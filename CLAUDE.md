@@ -42,10 +42,12 @@ cargo build && cargo test && cargo clippy --all-targets && cargo fmt --check
 cargo test --release --test budget -- --nocapture    # measured budgets
 ```
 
-The budget suite is release-only and slow: it measures the hook at the turn
-boundary (< 5 ms) and a cold query against a generated 100k-exchange archive
-(p95 < 100 ms), which it builds by ingesting transcripts through the real
-parser. Unit tests sit beside the code; `tests/` drives the real binary against
+The budget suite is release-only, slow, and internally serialised: it measures
+the `Stop` hook at the turn boundary (< 5 ms), a cold query against a generated
+100k-exchange archive (p95 < 100 ms), and the `UserPromptSubmit` recall hook
+against the same archive and the same 100 ms. It builds that archive by
+ingesting transcripts through the real parser. Its two tests take a mutex —
+running them concurrently measures the disk rather than the program. Unit tests sit beside the code; `tests/` drives the real binary against
 a temp database, and `tests/search.rs` runs scenarios 1 and 2 verbatim. Fixtures are in `tests/fixtures/<adapter>/` — real record *shapes*,
 synthetic content, one per finding in `docs/phases/`. `TMEM_HOME`,
 `TMEM_CLAUDE_PROJECTS` and `TMEM_CLAUDE_SETTINGS` redirect the data directory
@@ -57,6 +59,7 @@ and transcript tree; use them for anything run by hand.
 and forward-only refinery migrations · `src/capture/` ingest, hook queue, and
 `adapters/` · `src/search/` FTS5 match building and BM25 ranking ·
 `src/redact/` pre-write pattern rules and the user rule file ·
+`src/mcp/` the three agent tools and a hand-rolled JSON-RPC stdio server ·
 `src/output.rs` pipe detection, exit codes, formatting.
 
 `exchanges_fts` is maintained by triggers on `exchanges`, not by the write path.
@@ -64,6 +67,18 @@ Anything that changes a row updates the index without knowing it exists.
 
 **Every write path redacts and honours the `forgotten` tombstone.** There are
 two — transcript ingest and `tmem import` — and a third would need both again.
+
+**Every agent-facing read goes through `db::open_readonly`.** Read-only is the
+open flags, not the tool list: `src/mcp/` defines the three tools once and MCP,
+`tmem tools` and `tmem call` are envelopes over it. Results carry `cite` (the
+`tmem show` that proves them) and `why`. An unknown tool argument is an error,
+never a wider search.
+
+**Automatic recall is off by default, and that means no hook is registered** —
+`tmem recall --enable` writes both the config and the `UserPromptSubmit` entry,
+and `doctor` fails if they disagree. Whether anything is injected is decided by
+term coverage, never by a BM25 score; see
+[phase-4.md](docs/phases/phase-4.md) finding 1 before reaching for one.
 
 Adapters declare their own dedup key and injected-block vocabulary; neither is
 universal — see `src/capture/adapters/mod.rs` and
