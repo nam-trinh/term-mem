@@ -17,7 +17,29 @@ use crate::db::{self, queries};
 use crate::output::{EXIT_EMPTY, EXIT_OK};
 use crate::paths;
 use anyhow::Result;
+use std::io::IsTerminal;
 use std::path::PathBuf;
+
+/// There are three states, not two, and conflating the last two is how a script
+/// deletes an archive.
+///
+/// With a terminal on stdin, ask. With `-y`, proceed. With neither — a cron
+/// job, a CI step, an agent, `< /dev/null` — there is no one to ask, so the
+/// only safe answer on the one irreversible command is to refuse and say how to
+/// mean it. Phase 1 moved this gate from stdout to stdin so that
+/// `tmem forget <id> | tee log` still prompts; it did not consider the case
+/// where stdin is the thing being redirected.
+fn confirmable(yes: bool) -> Result<bool> {
+    if yes {
+        return Ok(false);
+    }
+    if std::io::stdin().is_terminal() {
+        return Ok(true);
+    }
+    anyhow::bail!(
+        "refusing to delete without a terminal to confirm at — pass -y/--yes if you mean it"
+    )
+}
 
 pub fn run(
     id: Option<String>,
@@ -73,7 +95,7 @@ pub fn run(
 
     // Gated on *stdin*, not stdout: `tmem forget <id> | tee log` is still a
     // person at a keyboard, and this is the one command that cannot be undone.
-    if !yes && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+    if confirmable(yes)? {
         println!("about to permanently delete:");
         println!();
         println!(
@@ -109,7 +131,7 @@ fn forget_many(conn: &mut rusqlite::Connection, filter: &Filter, yes: bool) -> R
         eprintln!("tmem: nothing matches — nothing deleted");
         return Ok(EXIT_EMPTY);
     }
-    if !yes && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+    if confirmable(yes)? {
         println!(
             "about to permanently delete {} exchange{}:",
             rows.len(),

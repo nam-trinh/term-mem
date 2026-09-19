@@ -625,3 +625,113 @@ fn a_result_containing_awkward_unicode_does_not_abort() {
     e.cmd().args(["ffmpeg"]).assert().code(0);
     e.cmd().args(["search", "istanbul"]).assert().code(0);
 }
+
+/// `forget` gated its confirmation on stdin being a terminal, which answers
+/// "is there someone to ask" and was then read as "may I proceed". A cron job,
+/// a CI step, an agent, or a stray `< /dev/null` deleted the selection outright
+/// and VACUUMed after it. The blast radius of the bulk selectors makes this the
+/// worst possible place for it.
+///
+/// Written from the promise: "forget confirms, and -y is how you skip that".
+#[test]
+fn forget_refuses_to_delete_unattended_without_yes() {
+    let e = Env::new();
+    scenario_one(&e);
+
+    // assert_cmd gives the child a non-terminal stdin, which is the case.
+    e.cmd()
+        .args(["forget", "--in", "/home/dev/talks/pycon-2026"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("-y"));
+    assert_eq!(e.count("exchanges"), 2, "nothing may be deleted");
+
+    e.cmd().args(["forget", "--last"]).assert().code(2);
+    assert_eq!(e.count("exchanges"), 2, "nothing may be deleted");
+
+    // And -y is how a script says it means it.
+    e.cmd()
+        .args(["forget", "--in", "/home/dev/talks/pycon-2026", "-y"])
+        .assert()
+        .success();
+    assert_eq!(e.count("exchanges"), 1);
+}
+
+/// A self-closing injected element carries no prompt. Phase 1 rejected it by
+/// accident (it matched the tag name before the attributes); Phase 2's first
+/// fix reinstated it as a prompt by accident, through the fallback that keeps
+/// the text of an *unclosed* tag so that "why does <ide_opened_file> appear
+/// here?" survives. Both rules are wanted; this is the line between them.
+#[test]
+fn a_self_closing_telemetry_element_is_not_a_prompt() {
+    let e = Env::new();
+    e.write_transcript(
+        "selfclose.jsonl",
+        r#"{"type":"user","uuid":"z1","parentUuid":null,"sessionId":"sz","timestamp":"2026-03-03T14:00:00.000Z","cwd":"/home/dev/x","message":{"role":"user","content":"<ide_selection file=\"src/main.rs\" start=\"3\" end=\"9\"/>"}}
+{"type":"assistant","uuid":"z2","parentUuid":"z1","sessionId":"sz","timestamp":"2026-03-03T14:00:01.000Z","cwd":"/home/dev/x","message":{"role":"assistant","model":"m","content":[{"type":"text","text":"an answer"}]}}
+{"type":"user","uuid":"z3","parentUuid":"z2","sessionId":"sz","timestamp":"2026-03-03T14:01:00.000Z","cwd":"/home/dev/x","message":{"role":"user","content":"why does <ide_selection> show up in my logs?"}}
+{"type":"assistant","uuid":"z4","parentUuid":"z3","sessionId":"sz","timestamp":"2026-03-03T14:01:01.000Z","cwd":"/home/dev/x","message":{"role":"assistant","model":"m","content":[{"type":"text","text":"editor telemetry"}]}}
+"#,
+    );
+    e.cmd().args(["capture", "--all"]).assert().success();
+
+    let prompts = e.query("SELECT prompt FROM exchanges ORDER BY ts");
+    assert_eq!(
+        prompts,
+        vec!["why does <ide_selection> show up in my logs?"],
+        "the self-closing element must not become an exchange, and the question \
+         that merely mentions the tag must survive intact"
+    );
+}
+
+/// The "unchanged" comparison grew field by field, and each time the comment
+/// claimed more than the code did. `repo` is resolved at capture from the
+/// filesystem, so it changes for reasons the transcript knows nothing about:
+/// capture an exchange, run `git init`, capture the next turn, and the session
+/// is split between a row with a repo and a row without — which `--repo` then
+/// returns half of, with no way to repair it.
+#[test]
+fn re_ingest_repairs_a_row_whose_repo_was_not_yet_resolvable() {
+    let e = Env::new();
+    let dir = e.home().join("later-a-repo");
+    std::fs::create_dir_all(&dir).unwrap();
+    let body = format!(
+        r#"{{"type":"user","uuid":"r1","parentUuid":null,"sessionId":"sr","timestamp":"2026-03-03T14:00:00.000Z","cwd":"{d}","message":{{"role":"user","content":"first question"}}}}
+{{"type":"assistant","uuid":"r2","parentUuid":"r1","sessionId":"sr","timestamp":"2026-03-03T14:00:01.000Z","cwd":"{d}","message":{{"role":"assistant","model":"m","content":[{{"type":"text","text":"first answer"}}]}}}}
+"#,
+        d = dir.display()
+    );
+    let path = e.write_transcript("repo.jsonl", &body);
+    e.cmd().args(["capture", "--all"]).assert().success();
+    assert_eq!(
+        e.query("SELECT COALESCE(repo,'<none>') FROM exchanges"),
+        vec!["<none>"]
+    );
+
+    // The checkout appears, and the session carries on.
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    std::fs::write(
+        &path,
+        format!(
+            "{body}{}",
+            format_args!(
+                r#"{{"type":"user","uuid":"r3","parentUuid":"r2","sessionId":"sr","timestamp":"2026-03-03T14:05:00.000Z","cwd":"{d}","message":{{"role":"user","content":"second question"}}}}
+{{"type":"assistant","uuid":"r4","parentUuid":"r3","sessionId":"sr","timestamp":"2026-03-03T14:05:01.000Z","cwd":"{d}","message":{{"role":"assistant","model":"m","content":[{{"type":"text","text":"second answer"}}]}}}}
+"#,
+                d = dir.display()
+            )
+        ),
+    )
+    .unwrap();
+    e.cmd()
+        .args(["capture", "--path"])
+        .arg(&path)
+        .assert()
+        .success();
+
+    assert_eq!(
+        e.query("SELECT COALESCE(repo,'<none>') FROM exchanges ORDER BY ts"),
+        vec!["later-a-repo", "later-a-repo"],
+        "half a session is worse than none of it: --repo would return one row"
+    );
+}

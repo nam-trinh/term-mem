@@ -178,7 +178,7 @@ impl ClaudeCode {
         // are different questions. See docs/phases/phase-2.md finding 1.
         let stripped = strip_injected_blocks(&text, self.injected_block_tags());
         let stripped = stripped.trim();
-        if stripped.is_empty() {
+        if stripped.is_empty() || only_markup(stripped, self.injected_block_tags()) {
             return None; // the record was nothing but injected content
         }
         // Note what is *not* consulted: `promptSource` and `origin.kind`. Both
@@ -244,16 +244,58 @@ fn strip_injected_blocks(text: &str, tags: &[&str]) -> String {
                     rest = &after[c + close.len()..];
                     continue;
                 }
-                // Unclosed. Treat it as ordinary text rather than swallowing
-                // the remainder: "why does <ide_opened_file> appear here?" is a
-                // question someone asked, and capture is the irreversible half.
-                // A stray tag in a prompt is cosmetic; a truncated prompt is not.
+                // Self-closing: `<ide_selection file="x" start="3"/>` is a whole
+                // element and carries no prompt. Phase 1 rejected it by
+                // accident, by matching the tag name before the attributes;
+                // Phase 2's first fix reinstated it as a prompt by accident,
+                // through the unclosed-tag fallback below.
+                if let Some(end) = after.find('>') {
+                    if after[..end].ends_with('/') {
+                        rest = &after[end + 1..];
+                        continue;
+                    }
+                }
+                // Genuinely unclosed. Treat it as ordinary text rather than
+                // swallowing the remainder: "why does <ide_opened_file> appear
+                // here?" is a question someone asked, and capture is the
+                // irreversible half. A stray tag in a prompt is cosmetic; a
+                // truncated prompt is not. `only_markup` below is what stops
+                // this from turning a bare opener into an exchange.
             }
         }
         out.push('<');
         rest = after;
     }
     out
+}
+
+/// Is what survived stripping just the wreckage of an injected block — a bare
+/// opener or closer and nothing a person wrote?
+///
+/// This is the guard on the unclosed-tag fallback. Keeping the text of a stray
+/// tag inside a real question is right; promoting a lone `<ide_selection …>`
+/// into an exchange is not.
+fn only_markup(text: &str, tags: &[&str]) -> bool {
+    let mut rest = text;
+    let mut saw_prose = false;
+    while let Some(lt) = rest.find('<') {
+        if !rest[..lt].trim().is_empty() {
+            saw_prose = true;
+        }
+        let after = &rest[lt + 1..];
+        let name = after.strip_prefix('/').unwrap_or(after);
+        let Some(end) = name.find(['>', ' ', '\n', '\t']) else {
+            return false;
+        };
+        if !tags.contains(&&name[..end]) {
+            return false;
+        }
+        match after.find('>') {
+            Some(gt) => rest = &after[gt + 1..],
+            None => return !saw_prose,
+        }
+    }
+    !saw_prose && rest.trim().is_empty()
 }
 
 impl Adapter for ClaudeCode {

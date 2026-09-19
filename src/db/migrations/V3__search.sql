@@ -8,8 +8,13 @@
 -- capture time — and the index stays external-content over `exchanges`.
 ALTER TABLE exchanges ADD COLUMN commands_text TEXT NOT NULL DEFAULT '';
 
+-- Ordered by `seq`, to agree with the Rust that writes this column from here
+-- on. `group_concat` has no inherent order, so without the inner ordered
+-- subquery an upgraded archive can disagree with its own parser about a
+-- multi-command exchange and report a spurious `updated` on a no-op re-ingest.
 UPDATE exchanges SET commands_text = COALESCE(
-  (SELECT group_concat(cmd, char(10)) FROM commands WHERE exchange_id = exchanges.id), '');
+  (SELECT group_concat(cmd, char(10))
+     FROM (SELECT cmd FROM commands WHERE exchange_id = exchanges.id ORDER BY seq)), '');
 
 -- `commands_text` is weighted above prose at query time. docs/scenarios.md:
 -- the extracted command line is the highest-signal region of a response and the

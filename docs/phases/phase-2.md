@@ -277,11 +277,62 @@ confirmed to fail against the unfixed code before being kept — including the
 truncation sweep, whose first version padded past the cut and passed against the
 bug.
 
+## 8. A second review found four more, including one the first round created
+
+The first review is finding 7. A second pass over the same branch found four
+more, and the shape of the list is the interesting part: **one of them was
+introduced by the fix for the first round, and two are the same comparison
+being wrong for the third time.**
+
+1. **Bulk `forget` deleted unattended.** The confirmation is gated on stdin
+   being a terminal — Phase 1's finding 9 moved it there from stdout so that
+   `tmem forget <id> | tee log` still prompts. But "is there someone to ask"
+   was then read as "may I proceed", so with no terminal and no `-y`,
+   `tmem forget --in /` deleted everything and exited 0, with a `VACUUM` behind
+   it. Any cron job, CI step or agent invocation hits this. There are three
+   states, not two, and the third one refuses.
+
+2. **A self-closing injected element became a prompt.** Finding 1's fix keeps
+   the text of an *unclosed* injected tag, so that "why does
+   `<ide_opened_file>` appear here?" survives. `<ide_selection file="x"/>` takes
+   that same path — nothing closes it — so a record containing only editor
+   telemetry became a searchable exchange. Phase 1 rejected it, by accident:
+   its rule matched the tag name before the attributes. Both behaviours are
+   wanted and the line between them is now explicit.
+
+3. **"Everything is compared" was not true yet.** Finding 7's fix added the
+   prompt and the command text, and the comment claimed the rest. `repo` was
+   still not compared — and `repo` is resolved from the filesystem at capture,
+   so it changes for reasons the transcript knows nothing about. Capture an
+   exchange, run `git init`, capture the next turn, and the session is split
+   between a row with a repo and a row without, which `--repo` then returns
+   half of. Every column the row stores is now compared.
+
+4. **The migration's backfill was unordered.** `group_concat` has no inherent
+   order, and the Rust that maintains `commands_text` joins by `seq`, so an
+   upgraded archive could disagree with its own parser about a multi-command
+   exchange and report a spurious `updated` on a no-op re-ingest.
+
+Finding 7 drew a lesson about tests reaching the wrong surface. This round's is
+narrower and worse: **the same seven-line comparison has now been wrong three
+times, and each fix was written by someone reading the comment above it that
+explained the previous mistake.** The comment was accurate about history and
+aspirational about the present, twice. What ended it was not a better comment
+but deleting the choice — the function no longer decides which columns are safe
+to skip, because the answer keeps being "none of them".
+
+Worth stating plainly: two review rounds on one phase found eight defects, three
+of which lose or corrupt data, against a suite that was green and lints that
+were clean throughout. The suite is not the problem — it is the reason findings
+1 through 6 exist. But a green suite on this codebase means the paths someone
+thought of work, and nothing more.
+
 ## Verdict
 
-**Phase 2 ships, after a review pass that found four more defects** — one of
-which meant the capture fix this phase is named for applied to no archive that
-already existed (finding 7). Scope is complete as written: `exchanges_fts` maintained
+**Phase 2 ships, after two review passes that found eight defects between
+them** — one of which meant the capture fix this phase is named for applied to
+no archive that already existed (finding 7), and one of which was created by
+that fix (finding 8). Scope is complete as written: `exchanges_fts` maintained
 transactionally, the weighted `commands` column, `tmem <query>` as the default
 verb with the `PATH` collision check already in `init`, `--in`/`--since`/
 `--repo`/`--json`/`--limit`, highlighted snippets, pipe detection, exit codes,
@@ -305,6 +356,8 @@ What was surprising, in order:
    directory nothing looks in.
 6. That the phase's headline fix reached no existing archive, guarded by a
    comment explaining the previous version of the same mistake (finding 7).
+7. That fixing it introduced a new way for telemetry to become a prompt, and
+   that the same comparison was still wrong a third time (finding 8).
 
 ## Carried forward
 
@@ -322,6 +375,10 @@ What was surprising, in order:
 - **The volume question**, untouched for a third phase. 1.3 MB for five days of
   documentation work still says nothing about a code-heavy archive, and Phase 3
   needs that scan.
+- **`forget`'s non-interactive behaviour is now a refusal**, which is right for
+  a safety valve and is a behaviour change for any script that relied on the
+  old silence. Nothing ships that relies on it, but it is the kind of thing a
+  changelog would carry if this had users.
 - **No test has ever run the terminal formatting path.** Every integration test
   drives the binary through a pipe, so `print_hits`, `highlight` and the escape
   handling are covered only by unit tests calling them with `tty: true`. Two of

@@ -186,19 +186,63 @@ fn write_exchange(
     //     changed prompt entirely — and Phase 2 is the release that changed how
     //     prompts are extracted, so every row written by a Phase 1 binary would
     //     have kept its unstripped prompt forever.
+    //   * The first fix for that added the prompt and the command text, and a
+    //     review pointed out the comment then claimed more than the code did:
+    //     `repo` was still not compared, so an exchange captured before
+    //     `git init` kept `repo = NULL` while later turns in the same session
+    //     got the repo — `--repo` returning half a session, unrepairable.
     //
-    // The parse already happened; the row is already in hand. Comparing all of
-    // it costs nothing worth having.
-    let existing: Option<(String, String, String, String)> = tx
+    // So: every column the row stores. The parse already happened and the row
+    // is already in hand, and each round of guessing which subset is safe has
+    // cost more than the comparison ever would.
+    type Existing = (
+        String,
+        String,
+        String,
+        String,
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        String,
+    );
+    let existing: Option<Existing> = tx
         .query_row(
-            "SELECT id, prompt, response, commands_text \
-             FROM exchanges WHERE assistant = ?1 AND session_id = ?2 AND source_key = ?3",
+            "SELECT id, prompt, response, commands_text, ts, cwd, repo, git_branch, model, \
+             thread_id FROM exchanges \
+             WHERE assistant = ?1 AND session_id = ?2 AND source_key = ?3",
             params![assistant, &ex.session_id, &ex.source_key],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                    r.get(9)?,
+                ))
+            },
         )
         .optional()?;
 
-    if let Some((id, prev_prompt, prev_response, prev_commands)) = existing {
+    if let Some((
+        id,
+        prev_prompt,
+        prev_response,
+        prev_commands,
+        prev_ts,
+        prev_cwd,
+        prev_repo,
+        prev_branch,
+        prev_model,
+        prev_thread,
+    )) = existing
+    {
         let prev_files: Vec<String> = tx
             .prepare_cached("SELECT path FROM file_refs WHERE exchange_id = ?1 ORDER BY seq")?
             .query_map(params![&id], |r| r.get::<_, String>(0))?
@@ -206,6 +250,12 @@ fn write_exchange(
         if prev_prompt == ex.prompt
             && prev_response == ex.response
             && prev_commands == commands_text(ex)
+            && prev_ts == ex.ts_ms
+            && prev_cwd == ex.cwd
+            && prev_repo == repo
+            && prev_branch == ex.git_branch
+            && prev_model == ex.model
+            && prev_thread == ex.thread_id
             && prev_files.len() == ex.files.len()
             && prev_files.iter().zip(&ex.files).all(|(p, f)| *p == f.path)
         {
