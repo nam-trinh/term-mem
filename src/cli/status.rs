@@ -66,25 +66,35 @@ pub fn status() -> Result<i32> {
 
     // Phase 4. What an agent can reach, and whether anything is being injected
     // into prompts — the second of which the user must never have to guess at.
-    let recall = crate::cli::recall::Config::load()?;
+    // `load_or_default`, not `load`. `status` answers "what is in here and is
+    // it running?", and a settings file it cannot parse is one line of that
+    // answer — not a reason to abandon the other ten, which used to include
+    // whether capture was paused.
+    let (recall, recall_broken) = crate::cli::recall::Config::load_or_default();
     let recall_hooked = crate::cli::init::hook_registered(
         crate::cli::recall::HOOK_EVENT,
         crate::cli::recall::HOOK_COMMAND,
     );
     println!(
         "  recall      {}",
-        match (recall.enabled, recall_hooked) {
-            (true, true) => format!(
-                "ON — up to {} exchange(s), ~{} tokens, prepended to prompts",
-                recall.max_exchanges, recall.max_tokens
+        match (recall_broken.is_some(), recall.enabled, recall_hooked) {
+            (true, _, _) => format!(
+                "UNREADABLE SETTINGS, so nothing is injected — {}",
+                recall_broken.as_deref().unwrap_or("")
             ),
-            (false, false) => "off (the default) — `tmem recall --enable`".to_string(),
-            (c, h) => format!(
-                "INCONSISTENT — config says enabled={c}, {} hook {} — run `tmem recall \
-                 --enable` or `--disable`",
-                crate::cli::recall::HOOK_EVENT,
-                if h { "is registered" } else { "is absent" }
-            ),
+            _ => match (recall.enabled, recall_hooked) {
+                (true, true) => format!(
+                    "ON — up to {} exchange(s), ~{} tokens, prepended to prompts",
+                    recall.max_exchanges, recall.max_tokens
+                ),
+                (false, false) => "off (the default) — `tmem recall --enable`".to_string(),
+                (c, h) => format!(
+                    "INCONSISTENT — config says enabled={c}, {} hook {} — run `tmem recall \
+                     --enable` or `--disable`",
+                    crate::cli::recall::HOOK_EVENT,
+                    if h { "is registered" } else { "is absent" }
+                ),
+            },
         }
     );
 
@@ -100,11 +110,8 @@ pub fn status() -> Result<i32> {
     if std::env::var("TMEM").map(|v| v == "0").unwrap_or(false) {
         println!("  note        TMEM=0 is set in this shell; capture is off for it");
     }
-    let mcp_hooked = std::fs::read_to_string(paths::claude_settings_file()?)
-        .map(|s| s.contains("tmem mcp"))
-        .unwrap_or(false);
-    if mcp_hooked {
-        println!("  mcp         registered in Claude Code's settings (read-only)");
+    if let Some(where_) = mcp_registered_in() {
+        println!("  mcp         registered in {where_} (read-only)");
     }
     let ignored = crate::cli::ignore::load()?;
     if !ignored.is_empty() {
@@ -118,6 +125,44 @@ pub fn status() -> Result<i32> {
         println!("  queued      {q} capture(s) waiting — `tmem capture --drain`");
     }
     Ok(EXIT_OK)
+}
+
+/// Where, if anywhere, `tmem mcp` is registered as an MCP server.
+///
+/// Three places, because `claude mcp add` writes to a different one per scope,
+/// and none of them is `settings.json` — which is where this used to look, so
+/// the status line could never appear however the user had registered it.
+fn mcp_registered_in() -> Option<String> {
+    let names = |v: &serde_json::Value| {
+        v.get("mcpServers")
+            .and_then(|m| m.as_object())
+            .map(|m| {
+                m.values()
+                    .any(|s| s.get("command").and_then(|c| c.as_str()) == Some("tmem"))
+            })
+            .unwrap_or(false)
+    };
+    let read = |p: std::path::PathBuf| -> Option<serde_json::Value> {
+        serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()
+    };
+
+    // Project scope: .mcp.json beside the checkout the user is standing in.
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(v) = read(cwd.join(".mcp.json")) {
+            if names(&v) {
+                return Some("./.mcp.json".to_string());
+            }
+        }
+    }
+    // User and local scope, both inside ~/.claude.json.
+    let path = paths::claude_config_file().ok()?;
+    let v = read(path.clone())?;
+    if names(&v) {
+        return Some(tilde(&path.to_string_lossy()));
+    }
+    let here = std::env::current_dir().ok()?;
+    let local = v.get("projects")?.get(here.to_string_lossy().as_ref())?;
+    names(local).then(|| format!("{} (this project)", tilde(&path.to_string_lossy())))
 }
 
 pub fn doctor() -> Result<i32> {

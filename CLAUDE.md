@@ -47,7 +47,8 @@ the `Stop` hook at the turn boundary (< 5 ms), a cold query against a generated
 100k-exchange archive (p95 < 100 ms), and the `UserPromptSubmit` recall hook
 against the same archive and the same 100 ms. It builds that archive by
 ingesting transcripts through the real parser. Its two tests take a mutex —
-running them concurrently measures the disk rather than the program. Unit tests sit beside the code; `tests/` drives the real binary against
+running them concurrently measures the disk rather than the program — and both
+skip in a debug build, where the numbers mean nothing. Unit tests sit beside the code; `tests/` drives the real binary against
 a temp database, and `tests/search.rs` runs scenarios 1 and 2 verbatim. Fixtures are in `tests/fixtures/<adapter>/` — real record *shapes*,
 synthetic content, one per finding in `docs/phases/`. `TMEM_HOME`,
 `TMEM_CLAUDE_PROJECTS` and `TMEM_CLAUDE_SETTINGS` redirect the data directory
@@ -79,6 +80,14 @@ never a wider search.
 and `doctor` fails if they disagree. Whether anything is injected is decided by
 term coverage, never by a BM25 score; see
 [phase-4.md](docs/phases/phase-4.md) finding 1 before reaching for one.
+
+**`~/.claude/settings.json` is not our file.** All hook editing goes through
+`add_hook`/`remove_hook`/`hook_registered` in `src/cli/init.rs`, which share one
+`entry_names` matcher; three different ideas of "this hook is ours" is what
+[phase-4.md](docs/phases/phase-4.md) finding 8 is about. Remove only what we
+added, and never tidy anything adjacent. A config file that will not parse is
+fatal only where continuing would be worse than stopping — true for
+`redact.toml`, false for `recall.toml` (finding 9).
 
 Adapters declare their own dedup key and injected-block vocabulary; neither is
 universal — see `src/capture/adapters/mod.rs` and

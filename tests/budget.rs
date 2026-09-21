@@ -11,6 +11,11 @@
 //! and ignore checks, reading the payload, writing the queue entry, exit. The
 //! parse and the database write are deliberately not in it — that is the point
 //! of the queue.
+//!
+//! **Every test here skips in a debug build**, loudly. They had not, which made
+//! the plain `cargo test` in CLAUDE.md fail on numbers that were never claimed
+//! for an unoptimised binary — a red suite nobody was supposed to believe,
+//! which is the fastest way to teach a reader to ignore a failing test.
 
 mod common;
 
@@ -35,6 +40,18 @@ fn exclusive() -> std::sync::MutexGuard<'static, ()> {
 
 const BUDGET_MS: f64 = 5.0;
 const ITERATIONS: usize = 60;
+
+/// True in a debug build, where these numbers mean nothing.
+fn skip_unless_release(what: &str) -> bool {
+    if cfg!(debug_assertions) {
+        println!(
+            "\nSKIPPED {what}: budgets are only meaningful in a release build.\n  \
+             cargo test --release --test budget -- --nocapture\n"
+        );
+        return true;
+    }
+    false
+}
 
 fn percentile(sorted: &[f64], p: f64) -> f64 {
     let i = ((sorted.len() - 1) as f64 * p).round() as usize;
@@ -66,6 +83,9 @@ fn measure(e: &Env, transcript: &std::path::Path) -> Vec<f64> {
 
 #[test]
 fn hook_latency_is_under_five_milliseconds() {
+    if skip_unless_release("Stop hook latency") {
+        return;
+    }
     let _guard = exclusive();
     let e = Env::new();
     e.cmd().args(["init", "--no-hook"]).assert().success();
@@ -184,6 +204,9 @@ fn generate(e: &Env) -> std::path::PathBuf {
 
 #[test]
 fn search_p95_is_under_a_hundred_milliseconds_at_100k_exchanges() {
+    if skip_unless_release("search and recall latency") {
+        return;
+    }
     let _guard = exclusive();
     let e = Env::new();
     e.cmd().args(["init", "--no-hook"]).assert().success();
@@ -271,6 +294,7 @@ fn search_p95_is_under_a_hundred_milliseconds_at_100k_exchanges() {
     let short = "how do I fix the postgres migration lock problem I hit before";
     let long = "I am staring at a postgres migration that takes an exclusive lock on the                 whole table while it backfills a column, and the replicas drift behind                 until the ingress controller starts returning gateway timeouts, which                 looks a lot like the redis eviction problem from before, except the                 checkpoint table should have prevented exactly this";
     let mut worst_recall: f64 = 0.0;
+    let mut worst_recall_max: f64 = 0.0;
     for (name, prompt) in [("recall short", short), ("recall long", long)] {
         let payload = serde_json::json!({
             "session_id": "not-a-session-in-this-archive",
@@ -300,6 +324,7 @@ fn search_p95_is_under_a_hundred_milliseconds_at_100k_exchanges() {
             samples[samples.len() - 1]
         );
         worst_recall = worst_recall.max(p95);
+        worst_recall_max = worst_recall_max.max(samples[samples.len() - 1]);
     }
     println!();
     assert!(
@@ -307,5 +332,14 @@ fn search_p95_is_under_a_hundred_milliseconds_at_100k_exchanges() {
         "the UserPromptSubmit recall hook p95 was {worst_recall:.2} ms, over the \
          {SEARCH_BUDGET_MS} ms search budget — it is in the way of every prompt the user \
          types, and unlike the Stop hook it cannot enqueue and run away"
+    );
+    // The tail is genuinely close to the budget — a sampled max of 101 ms has
+    // been seen — so it gets its own, looser assertion rather than being left
+    // unwatched. A tail at twice the budget is a regression even when the p95
+    // still passes.
+    assert!(
+        worst_recall_max < SEARCH_BUDGET_MS * 2.0,
+        "the recall hook's slowest sample was {worst_recall_max:.2} ms; the p95 still passes \
+         but the tail has moved"
     );
 }

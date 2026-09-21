@@ -722,3 +722,256 @@ fn a_redacted_exchange_reaches_the_agent_as_stored_and_says_so() {
         .unwrap()
         .contains("term-mem's"));
 }
+
+// ── Regressions from the Phase 4 review ──────────────────────────────────
+
+/// `add_hook`/`hook_registered` matched a substring of the serialised group
+/// while `remove_hook` compared the `command` field exactly. A hook written by
+/// hand as `/usr/local/bin/tmem recall --hook` fell in the gap: `status` said
+/// ON, `--disable` said OFF, and the hook stayed. `doctor` then pointed at the
+/// command that had just failed silently — forever.
+#[test]
+fn a_hook_registered_by_absolute_path_is_recognised_and_removable() {
+    let e = Env::new();
+    archive(&e);
+    std::fs::write(
+        e.settings(),
+        r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"/usr/local/bin/tmem recall --hook"}]}]}}"#,
+    )
+    .unwrap();
+
+    e.cmd()
+        .args(["status"])
+        .assert()
+        .stdout(predicates::str::contains("INCONSISTENT"));
+
+    e.cmd().args(["recall", "--disable"]).assert().success();
+    let after = std::fs::read_to_string(e.settings()).unwrap();
+    assert!(
+        !after.contains("tmem recall --hook"),
+        "the absolute-path hook survived --disable: {after}"
+    );
+    // And `doctor` no longer loops: it is now genuinely off.
+    e.cmd()
+        .args(["doctor"])
+        .assert()
+        .stdout(predicates::str::contains("automatic recall is off"));
+}
+
+/// `--enable` must likewise not add a second copy of a hook already present
+/// under another spelling.
+#[test]
+fn enable_does_not_duplicate_a_hook_written_by_absolute_path() {
+    let e = Env::new();
+    archive(&e);
+    std::fs::write(
+        e.settings(),
+        r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"/opt/bin/tmem recall --hook"}]}]}}"#,
+    )
+    .unwrap();
+    e.cmd().args(["recall", "--enable"]).assert().success();
+    let after = std::fs::read_to_string(e.settings()).unwrap();
+    assert_eq!(after.matches("recall --hook").count(), 1, "{after}");
+}
+
+/// Turning recall off deleted a user's own `{"matcher": "x", "hooks": []}` —
+/// a placeholder they had written deliberately — because the group was empty
+/// afterwards. It was empty beforehand too. This is not our file.
+#[test]
+fn disable_leaves_a_users_own_empty_hook_group_alone() {
+    let e = Env::new();
+    archive(&e);
+    let original =
+        r#"{"hooks":{"UserPromptSubmit":[{"matcher":"placeholder","hooks":[]}]},"model":"opus"}"#;
+    std::fs::write(e.settings(), original).unwrap();
+
+    e.cmd().args(["recall", "--enable"]).assert().success();
+    e.cmd().args(["recall", "--disable"]).assert().success();
+
+    let after: Value =
+        serde_json::from_str(&std::fs::read_to_string(e.settings()).unwrap()).unwrap();
+    let before: Value = serde_json::from_str(original).unwrap();
+    assert_eq!(before, after, "settings.json did not come back untouched");
+}
+
+/// A `recall.toml` nobody can parse must stop *recall*, not `status` — which
+/// used to abandon its output halfway, taking the pause state and the ignore
+/// list with it.
+#[test]
+fn an_unparsable_recall_config_does_not_take_status_down() {
+    let e = Env::new();
+    archive(&e);
+    std::fs::write(e.data().join("recall.toml"), "enabled = yes-please").unwrap();
+
+    let out = e.cmd().args(["status"]).output().unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("UNREADABLE SETTINGS"), "{stdout}");
+    assert!(
+        stdout.contains("exchanges   3"),
+        "the rest still printed: {stdout}"
+    );
+    assert!(
+        stdout.contains("capture     ON"),
+        "pause state survived: {stdout}"
+    );
+
+    // `doctor` says the same thing and does not stop either.
+    e.cmd()
+        .args(["doctor"])
+        .assert()
+        .code(2)
+        .stdout(predicates::str::contains("will not parse"));
+}
+
+/// …and above all it must not stop `--disable`, which is the command `status`
+/// and `doctor` both tell the user to run. It rewrites the file, so it is also
+/// the repair.
+#[test]
+fn an_unparsable_recall_config_can_still_be_disabled() {
+    let e = Env::new();
+    archive(&e);
+    std::fs::write(e.data().join("recall.toml"), "enabled = yes-please").unwrap();
+
+    e.cmd().args(["recall", "--disable"]).assert().success();
+    e.cmd()
+        .args(["status"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("recall      off (the default)"));
+}
+
+/// `enable()` wrote `enabled = true` before the hook registration that then
+/// failed, leaving a permanent INCONSISTENT state behind a command the user
+/// watched exit 2.
+#[test]
+fn a_failed_enable_does_not_leave_the_config_saying_it_worked() {
+    let e = Env::new();
+    archive(&e);
+    std::fs::write(
+        e.settings(),
+        r#"{"hooks":{"UserPromptSubmit":"not-an-array"}}"#,
+    )
+    .unwrap();
+
+    e.cmd().args(["recall", "--enable"]).assert().code(2);
+    e.cmd()
+        .args(["status"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("recall      off (the default)"));
+    assert!(
+        !e.data().join("recall.toml").exists()
+            || !std::fs::read_to_string(e.data().join("recall.toml"))
+                .unwrap()
+                .contains("enabled = true"),
+        "the config claims a state the command failed to reach"
+    );
+}
+
+/// Asking `status` or `doctor` a question must not create anything.
+#[test]
+fn reading_the_hook_state_does_not_create_the_settings_directory() {
+    let e = Env::new();
+    archive(&e);
+    let settings = e.home().join("fresh/settings.json");
+    e.cmd()
+        .env("TMEM_CLAUDE_SETTINGS", &settings)
+        .args(["status"])
+        .assert()
+        .success();
+    assert!(
+        !settings.parent().unwrap().exists(),
+        "a predicate created {}",
+        settings.parent().unwrap().display()
+    );
+}
+
+/// `render -n 0` reported "nothing on stdin" for a perfectly good pipe, which
+/// points the user at the half that was working.
+#[test]
+fn render_distinguishes_an_empty_pipe_from_an_empty_request() {
+    let e = Env::new();
+    archive(&e);
+    let json = e
+        .cmd()
+        .args(["search", "clock", "skew", "--json"])
+        .output()
+        .unwrap()
+        .stdout;
+
+    let out = e
+        .cmd()
+        .args(["render", "--prompt-block", "-n", "0"])
+        .write_stdin(json.clone())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("-n 0 renders nothing"), "{err}");
+    assert!(!err.contains("nothing on stdin"), "blamed the pipe: {err}");
+
+    // A budget too small for the wrapper yields no block rather than a header
+    // with no memory in it.
+    let out = e
+        .cmd()
+        .args(["render", "--prompt-block", "--max-tokens", "1"])
+        .write_stdin(json)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty(), "{:?}", String::from_utf8(out.stdout));
+    assert!(String::from_utf8(out.stderr).unwrap().contains("too small"));
+}
+
+/// A search that was clamped *and* found nothing reported only the second, so
+/// the reason the agent's `limit` had been ignored went unsaid.
+#[test]
+fn a_clamped_and_empty_search_reports_both_facts() {
+    let e = Env::new();
+    archive(&e);
+    let out = e
+        .cmd()
+        .args([
+            "call",
+            "search_memory",
+            "--args",
+            r#"{"query":"zzzznothing","limit":5000}"#,
+        ])
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let note = v["note"].as_str().unwrap();
+    assert!(note.contains("clamped to 50"), "{note}");
+    assert!(note.contains("Nothing matched"), "{note}");
+}
+
+/// The MCP status line looked in settings.json, where `claude mcp add` never
+/// writes, so it could not appear however the user had registered the server.
+#[test]
+fn mcp_registration_is_detected_where_claude_actually_writes_it() {
+    let e = Env::new();
+    archive(&e);
+    let config = e.home().join("claude.json");
+
+    let before = e
+        .cmd()
+        .env("TMEM_CLAUDE_CONFIG", &config)
+        .args(["status"])
+        .output()
+        .unwrap();
+    assert!(!String::from_utf8(before.stdout)
+        .unwrap()
+        .contains("  mcp  "));
+
+    std::fs::write(
+        &config,
+        r#"{"mcpServers":{"term-mem":{"command":"tmem","args":["mcp"]}}}"#,
+    )
+    .unwrap();
+    e.cmd()
+        .env("TMEM_CLAUDE_CONFIG", &config)
+        .args(["status"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("mcp         registered in"));
+}

@@ -201,20 +201,99 @@ escape hatch (`tmem search call`) is already documented, so this ships as
 specified; it is recorded because it is the first time the reserved-word budget
 has actually been spent on a word with a meaning.
 
-## 8. Budgets: the rest
+## 8. Every defect the review found was in the file that is not ours
+
+Twelve findings came out of reviewing this phase, and they cluster hard. Five
+were in the settings.json editing — the one place term-mem writes to a file
+belonging to another program — and three of those were introduced by the
+refactor that was supposed to make it *safer*: Phase 1 had one hook editor,
+Phase 4 needed two, so it became a shared helper, and the helper grew three
+different ideas about what "this hook is ours" means.
+
+`add_hook` and `hook_registered` matched a substring of the serialised group;
+`remove_hook` compared the `command` field for equality. A user whose `tmem` is
+not on the hook's `PATH` writes `/usr/local/bin/tmem recall --hook` by hand,
+which lands in the gap: `status` reported ON, `--disable` reported OFF and did
+nothing, and `doctor` pointed at the command that had just failed silently.
+Permanently. All three now go through one `entry_names`, which compares for
+equality after normalising away the path the binary was invoked by.
+
+The second one is worse in kind. `remove_hook` dropped any group left with an
+empty `hooks` array — including a user's own `{"matcher": "x", "hooks": []}`,
+which was empty before term-mem touched it. Turning a feature off deleted a line
+of someone else's configuration. The rule that was missing is the obvious one in
+hindsight: **drop a group only if we are what emptied it.** Nothing in that file
+is ours to tidy.
+
+The generalisable lesson is not "be careful with JSON". It is that the
+refactor's stated justification — "two hand-rolled settings.json editors is two
+chances to corrupt a file that is not ours" — was right about the risk and
+wrong about where it lives. Consolidating three call sites into one helper does
+not give them one definition of identity unless you go and write it.
+
+## 9. A config-fatality rule does not transfer between config files
+
+`Config::load` was fatal on an unparsable `recall.toml`, and the comment said
+why: "for the same reason a broken `redact.toml` is fatal". The reasoning was
+copied rather than re-derived, and it does not survive the copy.
+
+A redaction rule that will not compile has to stop *capture*, because capturing
+unredacted is worse than capturing nothing. A recall config that will not parse
+should stop *recall*, because the alternative — injecting under settings nobody
+can read — is the harm. Those are not the same conclusion, and treating them as
+one produced the review's most embarrassing pairing:
+
+```
+$ tmem status
+…
+tmem: parsing recall.toml: TOML parse error at line 1, column 11
+$ tmem recall --disable
+tmem: parsing recall.toml: TOML parse error at line 1, column 11
+```
+
+`status` abandoned its output halfway, taking the pause state and the ignore
+list with it — the two lines a user checks when they suspect capture is not
+running. And the command both `status` and `doctor` tell you to run to fix the
+file was the one command the file stopped from running.
+
+`Config::load_or_default` is the fix, used by `status`, `preview` and
+`--disable`; it returns the defaults — which are **off** — plus the reason. The
+failure direction is now "nothing is injected", which is the safe one.
+
+## 10. The budget suite failed in debug, and had done since Phase 1
+
+`cargo test` is the first command in [CLAUDE.md](../../CLAUDE.md), and it ran
+`tests/budget.rs` against an unoptimised binary and failed on numbers nobody
+ever claimed for one. This phase's addition made it louder (272 ms against a
+100 ms budget) but did not cause it: the file has been release-only by
+convention and by doc comment, never by code, since Phase 1.
+
+A suite that is supposed to fail is a suite readers learn to skip, which is the
+opposite of what a budget assertion is for. Both tests now skip in a debug build
+and say which command to use instead, and `cargo test` is green for the first
+time.
+
+The recall hook's tail is genuinely close: a sampled max of 101.7 ms against the
+100 ms budget was seen during review, with p95 comfortably under. The p95 is
+what the budget asserts, consistent with Phases 1 and 2; the tail now has its
+own looser assertion at 2× rather than going unwatched.
+
+## 11. Budgets: the rest
 
 ```
 Stop hook latency (60 samples, release build):
-  12-record transcript     p50 2.03 ms   p95 2.70 ms   max 2.89 ms
-  8 MB transcript          p50 1.98 ms   p95 2.11 ms   max 2.38 ms
+  12-record transcript     p50 2.02 ms   p95 2.82 ms   max 2.94 ms
+  8 MB transcript          p50 2.00 ms   p95 2.91 ms   max 6.44 ms
 
 archive: 100000 exchanges, 139.5 MB
-  common two-term  p50  17.37 ms   p95  18.16 ms   max  18.88 ms
-  rare term        p50   3.05 ms   p95   3.13 ms   max   3.13 ms
-  filtered         p50  12.34 ms   p95  12.91 ms   max  12.91 ms
+  common two-term  p50  19.95 ms   p95  26.10 ms   max  27.10 ms
+  rare term        p50   3.24 ms   p95   4.08 ms   max   4.18 ms
+  filtered         p50  14.69 ms   p95  16.15 ms   max  16.21 ms
+  recall short     p50  77.68 ms   p95  87.79 ms   max  90.46 ms
+  recall long      p50  53.12 ms   p95  57.28 ms   max  81.56 ms
 ```
 
-Unchanged, and now measured without the interference in finding 5.
+Unchanged in shape, and now measured without the interference in finding 5.
 
 ## Verdict
 
@@ -235,6 +314,35 @@ The part of this phase most likely to be wrong in six months is the coverage
 floor. It is a better shape of answer than a score floor, and it is still a
 number nobody has validated against a real user's real prompts. Unlike the score
 floor, at least it fails the same way for everyone.
+
+## 12. Four smaller ones, recorded because they share a shape
+
+- **`hook_registered`, a predicate, created `~/.claude/` as a side effect** —
+  `read_settings` did the `create_dir_all` for every caller including the ones
+  that only ask a question. An unconfigured machine got a directory out of
+  running `tmem status`. The creation moved to `write_settings`, where a write
+  actually happens.
+- **`status`'s MCP line could never appear.** It grepped `settings.json`;
+  `claude mcp add` writes `mcpServers` to `~/.claude.json` (user scope), to
+  `projects.<cwd>.mcpServers` there (local scope), or to `.mcp.json` beside the
+  checkout (project scope). Never settings.json. The check now looks in all
+  three and says which one it found.
+- **`envelope`'s two notes overwrote each other**, so a `search_memory` that
+  was clamped *and* found nothing told the agent only the second thing.
+- **`render -n 0` blamed the pipe** — it reported "nothing on stdin" for
+  perfectly good input, because the truncation happened before the emptiness
+  check. And the ~480-character header sat outside `--max-tokens`, so
+  `--max-tokens 1` emitted a wrapper with no memory in it; the cap is now a cap,
+  and a budget too small for the wrapper produces no block at all.
+- **Invalid UTF-8 killed the MCP server.** The malformed-JSON test passed
+  because malformed JSON is still valid UTF-8; a client crashing mid-write
+  produces a truncated multi-byte character, and `read_line` on a `String` fails
+  the whole call. The loop reads bytes now.
+
+What these share with findings 8 and 9 is that each one is a place where the
+*stated* intent and the code disagreed, and the comment was the thing that was
+right. Every one of them had a doc comment describing the correct behaviour
+sitting directly above the code that did not do it.
 
 ## Carried forward
 
@@ -260,3 +368,9 @@ floor, at least it fails the same way for everyone.
 - **No test runs the terminal formatting path** — carried from
   [phase-2.md](phase-2.md) and [phase-3.md](phase-3.md), still true. Phase 4
   adds no terminal formatting, so it neither helps nor worsens it.
+- **The recall hook's tail sits close to the budget** — p95 88 ms, a sampled max
+  of 101.7 ms against 100 ms. Finding 4 names the lever if it is ever needed.
+- **Nothing tests term-mem against a real Claude Code settings.json.** Every
+  hook test writes the file itself, so the shapes under test are the shapes this
+  project imagined. Five review findings lived in that file, and two were about
+  shapes a real user writes and these tests did not.

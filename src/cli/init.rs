@@ -126,6 +126,58 @@ fn register_hook() -> Result<HookState> {
     add_hook("Stop", HOOK_COMMAND)
 }
 
+/// Does one hook entry — `{"type": "command", "command": "…"}` — name the
+/// command we are looking for?
+///
+/// The rule is exact equality after normalising away the path the binary was
+/// invoked by, so `/usr/local/bin/tmem recall --hook` and `tmem recall --hook`
+/// are the same hook. That case is not hypothetical: a user whose `tmem` is not
+/// on the hook's `PATH` writes the absolute form by hand, and it is the form
+/// `doctor` tells them to write.
+///
+/// **All three of `add_hook`, `remove_hook` and `hook_registered` go through
+/// this.** They used not to — `add` and `registered` matched a substring of the
+/// serialised group while `remove` compared the `command` field for equality —
+/// and the absolute-path spelling landed in the gap: `status` reported the hook
+/// ON, `--disable` reported it OFF, and neither was doing anything. `doctor`
+/// then pointed at the command that had just failed silently, forever.
+fn entry_names(entry: &Value, command: &str) -> bool {
+    let Some(found) = entry.get("command").and_then(Value::as_str) else {
+        return false;
+    };
+    normalise_command(found) == normalise_command(command)
+}
+
+/// `"/usr/local/bin/tmem recall --hook"` → `"tmem recall --hook"`. Only the
+/// program word is touched; the arguments have to match exactly, because
+/// `--hook` and `--drain` are different hooks.
+fn normalise_command(command: &str) -> String {
+    let command = command.trim();
+    let (program, rest) = match command.split_once(char::is_whitespace) {
+        Some((p, r)) => (p, r.trim()),
+        None => (command, ""),
+    };
+    let base = program
+        .rsplit(std::path::MAIN_SEPARATOR)
+        .next()
+        .unwrap_or(program);
+    if rest.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base} {rest}")
+    }
+}
+
+/// Every hook entry under `hooks.<event>`, flattened across the two shapes
+/// settings.json allows: a group with an inner `hooks` array, or a bare entry.
+fn entries(list: &[Value]) -> impl Iterator<Item = &Value> {
+    list.iter()
+        .flat_map(|group| match group.get("hooks").and_then(Value::as_array) {
+            Some(inner) => inner.iter().collect::<Vec<_>>(),
+            None => vec![group],
+        })
+}
+
 /// Add one command hook under `hooks.<event>`, preserving everything else in
 /// settings.json. Idempotent: an entry already naming the command is left
 /// alone.
@@ -152,7 +204,7 @@ pub fn add_hook(event: &str, command: &str) -> Result<HookState> {
         .as_array_mut()
         .with_context(|| format!("settings.json `hooks.{event}` is not an array"))?;
 
-    if serde_json::to_string(&list)?.contains(command) {
+    if entries(list).any(|e| entry_names(e, command)) {
         return Ok(HookState::AlreadyPresent(display));
     }
     list.push(json!({ "hooks": [{ "type": "command", "command": command }] }));
@@ -175,19 +227,22 @@ pub fn remove_hook(event: &str, command: &str) -> Result<usize> {
     else {
         return Ok(0);
     };
-    // Drop only the *inner* entries that name our command, then drop a group
-    // that is left empty. A user's own hooks may share the group and must
-    // survive — which is also why the count is of entries removed, not of
-    // groups: removing ours from a group that keeps others still changed the
-    // file, and a `removed == 0` there would skip the write.
+    // Drop the inner entries that name our command, and then the group only if
+    // *we* are what emptied it.
+    //
+    // The earlier version dropped any group whose `hooks` array was empty,
+    // which deleted a user's own `{"matcher": "x", "hooks": []}` — a placeholder
+    // they had written deliberately — as a side effect of turning recall off.
+    // This is not our file. Nothing in it is ours to tidy.
     let mut removed = 0usize;
     list.retain_mut(|group| {
         if let Some(inner) = group.get_mut("hooks").and_then(Value::as_array_mut) {
             let before = inner.len();
-            inner.retain(|h| h.get("command").and_then(Value::as_str) != Some(command));
-            removed += before - inner.len();
-            !inner.is_empty()
-        } else if group.get("command").and_then(Value::as_str) == Some(command) {
+            inner.retain(|h| !entry_names(h, command));
+            let took = before - inner.len();
+            removed += took;
+            !(took > 0 && inner.is_empty())
+        } else if entry_names(group, command) {
             removed += 1;
             false
         } else {
@@ -204,35 +259,40 @@ pub fn hook_registered(event: &str, command: &str) -> bool {
     let Ok(path) = paths::claude_settings_file() else {
         return false;
     };
+    // A predicate must not create anything. `status` and `doctor` both call
+    // this, and an unconfigured machine used to get a `~/.claude/` directory
+    // out of being asked a question.
+    if !path.exists() {
+        return false;
+    }
     let Ok(root) = read_settings(&path) else {
         return false;
     };
     root.get("hooks")
         .and_then(|h| h.get(event))
-        .map(|l| {
-            serde_json::to_string(l)
-                .unwrap_or_default()
-                .contains(command)
-        })
+        .and_then(Value::as_array)
+        .map(|l| entries(l).any(|e| entry_names(e, command)))
         .unwrap_or(false)
 }
 
 fn read_settings(path: &std::path::Path) -> Result<Value> {
     let display = path.to_string_lossy().into_owned();
-    if path.exists() {
-        let text = std::fs::read_to_string(path).with_context(|| format!("reading {display}"))?;
-        if text.trim().is_empty() {
-            return Ok(json!({}));
-        }
-        return serde_json::from_str(&text).with_context(|| format!("parsing {display}"));
+    if !path.exists() {
+        return Ok(json!({}));
     }
-    if let Some(p) = path.parent() {
-        std::fs::create_dir_all(p)?;
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading {display}"))?;
+    if text.trim().is_empty() {
+        return Ok(json!({}));
     }
-    Ok(json!({}))
+    serde_json::from_str(&text).with_context(|| format!("parsing {display}"))
 }
 
 fn write_settings(path: &std::path::Path, root: &Value) -> Result<()> {
+    // The directory is created here rather than in `read_settings`, which is
+    // also reached by predicates that must not have side effects.
+    if let Some(p) = path.parent() {
+        std::fs::create_dir_all(p)?;
+    }
     // Write-then-rename: this is the user's file and a half-written
     // settings.json costs them their whole hook configuration, not just ours.
     let tmp = path.with_extension("json.tmp");

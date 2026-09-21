@@ -292,10 +292,25 @@ tmem recall --hook              the UserPromptSubmit hook itself
 
 Off by default means **no hook is registered at all** — not a hook that fires
 and decides to do nothing, which still costs a process spawn on every prompt and
-still has to be trusted to read its own flag. `--enable` writes both halves;
-`status` and `doctor` complain loudly if they ever disagree, because one
-direction means the user is being injected into without knowing and the other
-means they believe they are and are not.
+still has to be trusted to read its own flag. `--enable` registers the hook
+first and writes the config second, so a registration that fails leaves nothing
+behind claiming it worked. `status` and `doctor` complain loudly if the two ever
+disagree, because one direction means the user is being injected into without
+knowing and the other means they believe they are and are not.
+
+A hook is matched by its command after the invoking path is normalised away, so
+`/usr/local/bin/tmem recall --hook` and `tmem recall --hook` are the same hook —
+`--disable` removes a hook the user wrote by hand, and `--enable` does not add a
+second copy of one. **`--disable` never removes anything else**, including a
+group of the user's own that was already empty. settings.json is not term-mem's
+file and nothing in it is term-mem's to tidy.
+
+A `recall.toml` that will not parse turns recall **off** and says so in `status`
+and `doctor`; it does not stop either of them, and it does not stop `--disable`,
+which rewrites the file and is therefore also the repair. This is deliberately
+unlike `redact.toml`, which is fatal: a redactor the user believes is running
+and silently is not is the worst outcome there, whereas here the worst outcome
+is injecting under settings nobody can read.
 
 When it is on, at most **3 exchanges and ~1500 tokens** are prepended, and the
 user sees a line naming the ids in their own terminal as well as the attribution

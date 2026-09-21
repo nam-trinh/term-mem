@@ -355,14 +355,17 @@ fn envelope(tool: &str, results: Vec<Value>, clamped: bool, note: Option<String>
         "source": "term-mem — the user's own local archive, read-only",
     });
     let o = v.as_object_mut().expect("object");
+    // Both notes, joined — not one overwriting the other. A search that was
+    // clamped *and* found nothing used to report only the second, so the agent
+    // was told "nothing matched" while the reason its limit had been ignored
+    // went unsaid.
+    let mut notes = Vec::new();
     if clamped {
-        o.insert(
-            "note".into(),
-            json!(format!("'limit' was clamped to {MAX_LIMIT}.")),
-        );
+        notes.push(format!("'limit' was clamped to {MAX_LIMIT}."));
     }
-    if let Some(n) = note {
-        o.insert("note".into(), json!(n));
+    notes.extend(note);
+    if !notes.is_empty() {
+        o.insert("note".into(), json!(notes.join(" ")));
     }
     v
 }

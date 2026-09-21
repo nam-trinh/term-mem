@@ -70,15 +70,38 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Read the settings, or fail saying why.
+    ///
+    /// A broken file is an error for the same reason a broken `redact.toml` is:
+    /// a user who edited it believes the number they wrote is in force, and
+    /// silently falling back to ours makes them wrong.
+    ///
+    /// The difference — and it was got wrong first time — is **what the error
+    /// should cost**. A redaction rule that will not compile has to stop
+    /// capture, because capturing unredacted is worse. A recall config that
+    /// will not parse should stop *recall*, and nothing else. Making it fatal
+    /// everywhere took out `tmem status` halfway through its output and, worse,
+    /// took out `tmem recall --disable` — so the one command that could fix the
+    /// file was the one command that could not run. Callers that must keep
+    /// working use [`Config::load_or_default`].
     pub fn load() -> Result<Config> {
         let p = paths::recall_config()?;
         let Ok(text) = std::fs::read_to_string(&p) else {
             return Ok(Config::default());
         };
-        // Fatal rather than defaulted, for the same reason a broken redact.toml
-        // is fatal: a user who edited this file believes the number they wrote
-        // is in force, and silently falling back to ours makes them wrong.
         toml::from_str(&text).with_context(|| format!("parsing {}", p.display()))
+    }
+
+    /// The settings, or the defaults plus the reason they are being used.
+    ///
+    /// The defaults are **off**, so a file nobody can parse fails in the
+    /// direction that injects nothing rather than the direction that injects
+    /// something the user did not ask for.
+    pub fn load_or_default() -> (Config, Option<String>) {
+        match Config::load() {
+            Ok(c) => (c, None),
+            Err(e) => (Config::default(), Some(format!("{e:#}"))),
+        }
     }
 
     fn save(&self) -> Result<()> {
@@ -113,8 +136,12 @@ struct PromptPayload {
 pub fn enable() -> Result<i32> {
     let mut cfg = Config::load()?;
     cfg.enabled = true;
+    // The hook first, the config second. The other order leaves `enabled =
+    // true` on disk after an `add_hook` that failed and exited 2 — a permanent
+    // INCONSISTENT state produced by a command the user watched fail.
+    let state = crate::cli::init::add_hook(HOOK_EVENT, HOOK_COMMAND)?;
     cfg.save()?;
-    match crate::cli::init::add_hook(HOOK_EVENT, HOOK_COMMAND)? {
+    match state {
         crate::cli::init::HookState::Added(p) => {
             println!("automatic recall ON — hook registered in {}", tilde(&p))
         }
@@ -139,7 +166,13 @@ pub fn enable() -> Result<i32> {
 }
 
 pub fn disable() -> Result<i32> {
-    let mut cfg = Config::load()?;
+    // `load_or_default`, not `load`: this is the command that fixes a broken
+    // config file, so it must not be stopped by one. The whole file is
+    // overwritten with a valid one below, which is also the repair.
+    let (mut cfg, broken) = Config::load_or_default();
+    if let Some(why) = broken {
+        eprintln!("tmem: {why}\n  (rewriting it with the defaults, which are off)");
+    }
     cfg.enabled = false;
     cfg.save()?;
     let n = crate::cli::init::remove_hook(HOOK_EVENT, HOOK_COMMAND)?;
@@ -156,7 +189,13 @@ pub fn disable() -> Result<i32> {
 }
 
 pub fn status() -> Result<i32> {
-    let cfg = Config::load()?;
+    let (cfg, broken) = Config::load_or_default();
+    if let Some(why) = broken {
+        println!("  recall      UNREADABLE SETTINGS — nothing is injected");
+        println!("  error       {why}");
+        println!("  fix         tmem recall --disable, then --enable");
+        return Ok(crate::output::EXIT_ERROR);
+    }
     let hooked = crate::cli::init::hook_registered(HOOK_EVENT, HOOK_COMMAND);
     println!(
         "  recall      {}",
@@ -193,7 +232,10 @@ pub fn status() -> Result<i32> {
 /// and why each exchange was chosen. This is the user-facing half of the Exit
 /// criterion: the recall path is inspectable without a live session.
 pub fn preview(terms: &[String]) -> Result<i32> {
-    let cfg = Config::load()?;
+    let (cfg, broken) = Config::load_or_default();
+    if let Some(why) = broken {
+        eprintln!("tmem: {why}\n  (previewing with the defaults instead)");
+    }
     let text = terms.join(" ");
     let chosen = select(&text, None, &cfg)?;
     if chosen.is_empty() {
@@ -215,7 +257,15 @@ pub fn preview(terms: &[String]) -> Result<i32> {
     if !cfg.enabled {
         eprintln!("  (automatic recall is off; this is a preview — `tmem recall --enable`)");
     }
-    print!("{}", block(&chosen, &cfg));
+    let text = block(&chosen, &cfg);
+    if text.is_empty() {
+        eprintln!(
+            "tmem recall: max_tokens = {} is too small for a context block",
+            cfg.max_tokens
+        );
+        return Ok(EXIT_EMPTY);
+    }
+    print!("{text}");
     Ok(EXIT_OK)
 }
 
@@ -262,6 +312,17 @@ pub fn hook() -> Result<i32> {
     if chosen.is_empty() {
         return Ok(EXIT_OK);
     }
+    let text = block(&chosen, &cfg);
+    if text.is_empty() {
+        // `max_tokens` set too low to hold the block's own header. Inject
+        // nothing rather than a wrapper with no memory in it, and say why —
+        // the user configured this and is the only one who can undo it.
+        eprintln!(
+            "tmem recall: max_tokens = {} is too small for a context block; nothing injected",
+            cfg.max_tokens
+        );
+        return Ok(EXIT_OK);
+    }
 
     // The visible half. stderr, so it reaches the user's terminal rather than
     // only the model's context — the block itself carries the attribution on
@@ -276,7 +337,6 @@ pub fn hook() -> Result<i32> {
             .join(" · ")
     );
 
-    let text = block(&chosen, &cfg);
     println!(
         "{}",
         serde_json::json!({

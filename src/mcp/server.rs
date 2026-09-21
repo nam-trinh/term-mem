@@ -41,12 +41,18 @@ pub fn run() -> Result<i32> {
 /// The loop, split from `run` so tests can drive it over a pair of buffers
 /// instead of a process.
 pub fn serve<R: BufRead, W: Write>(conn: &Connection, input: &mut R, out: &mut W) -> Result<()> {
-    let mut line = String::new();
+    // Bytes, not `String`. `read_line` on a `String` fails the whole call on
+    // invalid UTF-8, which took the server down on exactly the input it is
+    // supposed to answer with -32700 — the malformed-JSON test passed because
+    // malformed JSON is still valid UTF-8, and a truncated multi-byte character
+    // from a crashing client is not.
+    let mut raw: Vec<u8> = Vec::new();
     loop {
-        line.clear();
-        if input.read_line(&mut line)? == 0 {
+        raw.clear();
+        if input.read_until(b'\n', &mut raw)? == 0 {
             return Ok(()); // EOF: the client went away, which is how this ends.
         }
+        let line = String::from_utf8_lossy(&raw);
         if line.trim().is_empty() {
             continue;
         }
@@ -55,8 +61,16 @@ pub fn serve<R: BufRead, W: Write>(conn: &Connection, input: &mut R, out: &mut W
         };
         // One message per line, flushed immediately: a client blocked waiting
         // for a response that is sitting in our buffer looks like a hang.
-        writeln!(out, "{response}")?;
-        out.flush()?;
+        //
+        // A write error ends the loop rather than propagating: it means the
+        // client closed its end, which is the same event as EOF and is not a
+        // failure of this process.
+        if writeln!(out, "{response}")
+            .and_then(|()| out.flush())
+            .is_err()
+        {
+            return Ok(());
+        }
     }
 }
 
@@ -258,6 +272,28 @@ mod tests {
         // …but a *request* for an unsupported method is answered, with -32601.
         let r = call(&c, r#"{"jsonrpc":"2.0","id":9,"method":"resources/list"}"#).unwrap();
         assert_eq!(r["error"]["code"], METHOD_NOT_FOUND);
+    }
+
+    /// Bytes that are not UTF-8 are the case a `String`-based read loop dies
+    /// on, and a crashing client that writes half a character is exactly how
+    /// they arrive.
+    #[test]
+    fn invalid_utf8_does_not_take_the_server_down() {
+        let c = conn();
+        let mut input = std::io::Cursor::new(
+            [
+                b"\xff\xfe not json\n".to_vec(),
+                br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#.to_vec(),
+                b"\n".to_vec(),
+            ]
+            .concat(),
+        );
+        let mut out: Vec<u8> = Vec::new();
+        serve(&c, &mut input, &mut out).expect("the loop survived");
+        let lines: Vec<&str> = std::str::from_utf8(&out).unwrap().lines().collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("-32700"), "{}", lines[0]);
+        assert!(lines[1].contains(r#""result":{}"#), "{}", lines[1]);
     }
 
     /// Garbage on stdin must not take the server down: the client is another
