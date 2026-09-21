@@ -39,6 +39,24 @@ pub fn strip_markers(s: &str) -> String {
     s.replace([HL_OPEN, HL_CLOSE], "")
 }
 
+/// The terms FTS5 actually matched, lifted back out of its own markers. Cheaper
+/// and more honest than re-deriving them from the query: stemming means the
+/// text that matched is often not the text that was typed.
+pub fn matched_terms(snippet: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = snippet;
+    while let Some(o) = rest.find(HL_OPEN) {
+        let after = &rest[o + HL_OPEN.len_utf8()..];
+        let Some(c) = after.find(HL_CLOSE) else { break };
+        let term = after[..c].to_lowercase();
+        if !term.is_empty() && !out.contains(&term) {
+            out.push(term);
+        }
+        rest = &after[c + HL_CLOSE.len_utf8()..];
+    }
+    out
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Hit {
     #[serde(flatten)]
@@ -125,6 +143,12 @@ pub fn search(conn: &Connection, terms: &[String], filter: &Filter) -> Result<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matched_terms_come_back_out_of_the_markers() {
+        let s = format!("a {HL_OPEN}Concat{HL_CLOSE} b {HL_OPEN}ffmpeg{HL_CLOSE}");
+        assert_eq!(matched_terms(&s), vec!["concat", "ffmpeg"]);
+    }
 
     #[test]
     fn terms_are_or_ed_and_quoted() {

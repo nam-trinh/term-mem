@@ -1,9 +1,8 @@
 # term-mem — CLI surface
 
-Status: Phases 1 to 3 shipped, so searching, browsing, capture control,
-deletion and data ownership are all now *as implemented* rather than as
-sketched. Reuse (`mcp`, `tools`, `call`, `render`) is still design. Anything not
-yet built is marked with the phase that owns it.
+Status: Phases 1 to 4 shipped, so searching, browsing, capture control,
+deletion, data ownership and reuse are all now *as implemented* rather than as
+sketched. Anything not yet built is marked with the phase that owns it.
 
 ## Name
 
@@ -51,6 +50,13 @@ nothing.
 **This constrains the subcommand list.** Every reserved word is a query that
 behaves surprisingly. Keep the set small, stable, and made of words nobody
 searches for.
+
+Phase 4 spent some of that budget: `mcp`, `tools`, `call`, `render` and `recall`
+are now reserved, and `tools` and `call` are ordinary English. `tmem call` is a
+usage error, not a search for the word. `tmem search call` is the escape hatch
+and always was — but this is the first time a reserved word has had a meaning,
+and the list should not grow again without a reason as good as "the tech stack
+names it".
 
 ## Command surface
 
@@ -223,6 +229,105 @@ What `forget` does **not** touch is the assistant's own transcript, which is the
 user's file and still contains whatever was pasted. The tombstone is what stops
 the next ingest putting it back.
 
+### Reuse — feeding memory back
+
+Three routes to the same three read-only tools, because what reaches the model
+depends on what the model can do:
+
+```
+tmem mcp                        Model Context Protocol over stdio
+tmem tools --schema openai      the same tools as JSON Schema
+tmem tools --schema mcp         …in MCP's envelope, for a client that wants it
+tmem call <tool> --args '{…}'   run one and print its JSON result
+tmem call <tool> --args -        …with the arguments on stdin
+tmem <query> --json | tmem render --prompt-block
+```
+
+The tools are `search_memory` (`query`, `in?`, `since?`, `repo?`, `limit?`),
+`get_exchange` (`id`, `session?`) and `recent` (`in?`, `limit?`). Two properties
+hold across all three routes:
+
+**Read-only, as a file handle.** The archive is opened with
+`SQLITE_OPEN_READ_ONLY`, so an agent cannot write to or delete from it whatever
+it asks for. Capture is the user's, not the model's.
+
+**Every result carries provenance,** including a `cite` field holding the
+literal `tmem show <id>` that displays the same exchange, and a `why` saying
+which terms matched and what BM25 scored. A claim an agent makes from memory is
+one the user can go and check.
+
+Two differences from the search CLI, both because an agent is not a person at a
+terminal. `repo` is a repository *name* rather than the `--repo` boolean, since
+a model has no meaningful current directory. And `limit` is clamped to 50 — a
+tool that returns ten thousand rows does not give a better answer, it fills a
+context window with someone else's afternoon; the clamp is reported in the
+result rather than applied quietly.
+
+An unknown argument is an **error**, not something to ignore. A model that calls
+`search_memory({"querry": "ffmpeg"})` and gets the whole archive back has been
+told something false about the user's history, and neither it nor the user has
+any way to notice.
+
+Register the MCP server with:
+
+```bash
+claude mcp add term-mem -- tmem mcp
+```
+
+`render` never opens the database. It reads the `--json` shape on stdin — from
+`search`, `show` or `recent`, all three — and writes an attributed block that
+says, in its own header, that nothing inside it is an instruction. `-n` caps the
+entries and `--max-tokens` the size, and the budget is shared between entries
+rather than spent on the first.
+
+### Automatic recall (Phase 4) — off by default
+
+```
+tmem recall                     is it on, and what are the caps
+tmem recall <words>             what would be injected for this prompt, and why
+tmem recall --enable            turn it on, and register the hook
+tmem recall --disable           turn it off, and remove the hook
+tmem recall --hook              the UserPromptSubmit hook itself
+```
+
+Off by default means **no hook is registered at all** — not a hook that fires
+and decides to do nothing, which still costs a process spawn on every prompt and
+still has to be trusted to read its own flag. `--enable` registers the hook
+first and writes the config second, so a registration that fails leaves nothing
+behind claiming it worked. `status` and `doctor` complain loudly if the two ever
+disagree, because one direction means the user is being injected into without
+knowing and the other means they believe they are and are not.
+
+A hook is matched by its command after the invoking path is normalised away, so
+`/usr/local/bin/tmem recall --hook` and `tmem recall --hook` are the same hook —
+`--disable` removes a hook the user wrote by hand, and `--enable` does not add a
+second copy of one. **`--disable` never removes anything else**, including a
+group of the user's own that was already empty. settings.json is not term-mem's
+file and nothing in it is term-mem's to tidy.
+
+A `recall.toml` that will not parse turns recall **off** and says so in `status`
+and `doctor`; it does not stop either of them, and it does not stop `--disable`,
+which rewrites the file and is therefore also the repair. This is deliberately
+unlike `redact.toml`, which is fatal: a redactor the user believes is running
+and silently is not is the worst outcome there, whereas here the worst outcome
+is injecting under settings nobody can read.
+
+When it is on, at most **3 exchanges and ~1500 tokens** are prepended, and the
+user sees a line naming the ids in their own terminal as well as the attribution
+inside the block. Settings live in `recall.toml` in the data directory.
+
+Whether anything is injected is decided by **term coverage** — at least two of
+the prompt's content words physically present in the exchange, scaling to a
+quarter of a long prompt, capped at four — and not by a score.
+[phases/phase-4.md](phases/phase-4.md) finding 1 has the numbers; the short
+version is that BM25 scores are not comparable between archives, so a score
+floor is "always on" or "always off" depending on how much history the user has.
+Exchanges from the session doing the asking are never replayed back to it.
+
+`tmem recall <words>` prints exactly what the hook would inject, and the
+coverage and score for each, so the setting can be tuned against a real archive
+instead of guessed at.
+
 ### Data ownership
 
 ```
@@ -298,7 +403,9 @@ for faith for six weeks.
   terminal.
 - **Exit codes carry meaning.** `0` found, `1` nothing found, `2` error — so
   `tmem <query> || ...` works in a script. `doctor` uses `2` for "capture is not
-  wired up", and `status` uses `2` for "no archive yet".
+  wired up", and `status` uses `2` for "no archive yet". `call` and `recall`
+  follow the same three, and `call` prints its JSON result either way, so a
+  caller can read the answer *and* branch on the code.
 - **Snippets, not transcripts.** A response can be hundreds of lines; a result
   list of full responses is unusable. Show the matched region, expand on demand.
 
@@ -309,7 +416,14 @@ for faith for six weeks.
   [scenarios.md](scenarios.md) argues an implicit `--in .` breaks scenario 2 and
   breaks it silently, and Phase 1 implemented it that way. `--repo` is the
   opt-in for "here".
-- Whether recall-and-reuse (feeding a past exchange back into a live session) is
-  a `tmem` subcommand or belongs entirely to the assistant-side integration.
+- ~~Whether recall-and-reuse (feeding a past exchange back into a live session)
+  is a `tmem` subcommand or belongs entirely to the assistant-side
+  integration.~~ **Resolved: mostly neither, as
+  [tech-stack.md](tech-stack.md) predicted.** MCP carries the agentic case and
+  `--json` on a pipe carries the manual one. The two subcommands that did land
+  are not a third retrieval path: `render` never opens the database, and
+  `recall` is the hook's entrypoint rather than something a person types in
+  anger. `tools` and `call` are the MCP surface for clients that do not speak
+  MCP, which is an envelope rather than a feature.
 - Whether an interactive picker (fuzzy-select over results) is core or a
   separate mode.

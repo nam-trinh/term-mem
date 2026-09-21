@@ -4,12 +4,22 @@ pub mod forget;
 pub mod ignore;
 pub mod init;
 pub mod pause;
+pub mod recall;
+pub mod render;
 pub mod search;
 pub mod show;
 pub mod status;
 pub mod timespec;
+pub mod tools;
 
 use crate::db::queries::Filter;
+
+/// `tmem mcp`. Here rather than in a `cli::` module because the server *is* the
+/// command — there is no argument handling to put in front of it.
+pub fn mcp_serve() -> Result<i32> {
+    crate::mcp::server::run()
+}
+
 use anyhow::Result;
 use std::path::PathBuf;
 

@@ -44,12 +44,31 @@ pub fn ignore_file() -> Result<PathBuf> {
     Ok(data_dir()?.join("ignore"))
 }
 
+/// Automatic recall's settings. A file, not a row, for the same reason `pause`
+/// is one: the `UserPromptSubmit` hook reads it on every prompt the user types.
+pub fn recall_config() -> Result<PathBuf> {
+    Ok(data_dir()?.join("recall.toml"))
+}
+
 /// Claude Code's transcript root.
 pub fn claude_projects_dir() -> Result<PathBuf> {
     if let Some(p) = std::env::var_os("TMEM_CLAUDE_PROJECTS") {
         return Ok(PathBuf::from(p));
     }
     Ok(home()?.join(".claude/projects"))
+}
+
+/// Claude Code's *config* file, which is not its settings file.
+///
+/// MCP servers live here — `claude mcp add` writes `mcpServers` at the top
+/// level for user scope, and under `projects.<cwd>.mcpServers` for local scope.
+/// `status` used to look for them in `settings.json`, where they never appear,
+/// so the line it printed could not fire.
+pub fn claude_config_file() -> Result<PathBuf> {
+    if let Some(p) = std::env::var_os("TMEM_CLAUDE_CONFIG") {
+        return Ok(PathBuf::from(p));
+    }
+    Ok(home()?.join(".claude.json"))
 }
 
 pub fn claude_settings_file() -> Result<PathBuf> {

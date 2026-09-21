@@ -2,7 +2,7 @@
 //! pipe detection, and exit codes that carry meaning.
 
 use crate::db::queries::Exchange;
-use crate::search::{Hit, HL_CLOSE, HL_OPEN};
+use crate::search::{matched_terms, Hit, HL_CLOSE, HL_OPEN};
 
 /// Bold yellow, and its reset. Every `HL_ON` in a rendered string has a
 /// matching `HL_OFF`, including on a truncated one.
@@ -46,6 +46,22 @@ pub fn fmt_datetime(ms: i64) -> String {
     let tod = secs.rem_euclid(86_400);
     format!(
         "{} {:02}:{:02}:{:02}Z",
+        fmt_date(ms),
+        tod / 3600,
+        (tod % 3600) / 60,
+        tod % 60
+    )
+}
+
+/// RFC 3339, UTC — the shape a machine consumer expects, and what every
+/// agent-facing result carries. `fmt_datetime` is the human spelling of the
+/// same instant and they must not be confused: a model handed
+/// `2026-03-03 14:22:07Z` will sometimes parse it and sometimes not.
+pub fn fmt_rfc3339(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let tod = secs.rem_euclid(86_400);
+    format!(
+        "{}T{:02}:{:02}:{:02}Z",
         fmt_date(ms),
         tod / 3600,
         (tod % 3600) / 60,
@@ -225,24 +241,6 @@ pub fn print_hits(hits: &[Hit]) {
     }
 }
 
-/// The terms FTS5 actually matched, lifted back out of its own markers. Cheaper
-/// and more honest than re-deriving them from the query: stemming means the
-/// text that matched is often not the text that was typed.
-fn matched_terms(snippet: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut rest = snippet;
-    while let Some(o) = rest.find(HL_OPEN) {
-        let after = &rest[o + HL_OPEN.len_utf8()..];
-        let Some(c) = after.find(HL_CLOSE) else { break };
-        let term = after[..c].to_lowercase();
-        if !term.is_empty() && !out.contains(&term) {
-            out.push(term);
-        }
-        rest = &after[c + HL_CLOSE.len_utf8()..];
-    }
-    out
-}
-
 fn hits_any(text: &str, terms: &[String]) -> bool {
     let lower = text.to_lowercase();
     terms.iter().any(|t| lower.contains(t.as_str()))
@@ -348,12 +346,6 @@ fn render_snippet(snippet: &str, tty: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn matched_terms_come_back_out_of_the_markers() {
-        let s = format!("a {HL_OPEN}Concat{HL_CLOSE} b {HL_OPEN}ffmpeg{HL_CLOSE}");
-        assert_eq!(matched_terms(&s), vec!["concat", "ffmpeg"]);
-    }
 
     /// The markers are U+0001 and U+0002. A pipe must receive neither them nor
     /// an escape sequence.

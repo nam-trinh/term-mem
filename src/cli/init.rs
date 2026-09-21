@@ -113,9 +113,9 @@ pub fn run(backfill: bool, no_hook: bool) -> Result<i32> {
     Ok(crate::output::EXIT_OK)
 }
 
-const HOOK_COMMAND: &str = "tmem capture --hook claude-code";
+pub const HOOK_COMMAND: &str = "tmem capture --hook claude-code";
 
-enum HookState {
+pub enum HookState {
     Added(String),
     AlreadyPresent(String),
 }
@@ -123,45 +123,182 @@ enum HookState {
 /// Register the `Stop` hook by editing Claude Code's settings.json in place,
 /// preserving everything else in the file.
 fn register_hook() -> Result<HookState> {
+    add_hook("Stop", HOOK_COMMAND)
+}
+
+/// Does one hook entry — `{"type": "command", "command": "…"}` — name the
+/// command we are looking for?
+///
+/// The rule is exact equality after normalising away the path the binary was
+/// invoked by, so `/usr/local/bin/tmem recall --hook` and `tmem recall --hook`
+/// are the same hook. That case is not hypothetical: a user whose `tmem` is not
+/// on the hook's `PATH` writes the absolute form by hand, and it is the form
+/// `doctor` tells them to write.
+///
+/// **All three of `add_hook`, `remove_hook` and `hook_registered` go through
+/// this.** They used not to — `add` and `registered` matched a substring of the
+/// serialised group while `remove` compared the `command` field for equality —
+/// and the absolute-path spelling landed in the gap: `status` reported the hook
+/// ON, `--disable` reported it OFF, and neither was doing anything. `doctor`
+/// then pointed at the command that had just failed silently, forever.
+fn entry_names(entry: &Value, command: &str) -> bool {
+    let Some(found) = entry.get("command").and_then(Value::as_str) else {
+        return false;
+    };
+    normalise_command(found) == normalise_command(command)
+}
+
+/// `"/usr/local/bin/tmem recall --hook"` → `"tmem recall --hook"`. Only the
+/// program word is touched; the arguments have to match exactly, because
+/// `--hook` and `--drain` are different hooks.
+fn normalise_command(command: &str) -> String {
+    let command = command.trim();
+    let (program, rest) = match command.split_once(char::is_whitespace) {
+        Some((p, r)) => (p, r.trim()),
+        None => (command, ""),
+    };
+    let base = program
+        .rsplit(std::path::MAIN_SEPARATOR)
+        .next()
+        .unwrap_or(program);
+    if rest.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base} {rest}")
+    }
+}
+
+/// Every hook entry under `hooks.<event>`, flattened across the two shapes
+/// settings.json allows: a group with an inner `hooks` array, or a bare entry.
+fn entries(list: &[Value]) -> impl Iterator<Item = &Value> {
+    list.iter()
+        .flat_map(|group| match group.get("hooks").and_then(Value::as_array) {
+            Some(inner) => inner.iter().collect::<Vec<_>>(),
+            None => vec![group],
+        })
+}
+
+/// Add one command hook under `hooks.<event>`, preserving everything else in
+/// settings.json. Idempotent: an entry already naming the command is left
+/// alone.
+///
+/// Phase 4 made this shared. `tmem recall --enable` registers a
+/// `UserPromptSubmit` hook through the same code, because two hand-rolled
+/// settings.json editors is two chances to corrupt a file that is not ours.
+pub fn add_hook(event: &str, command: &str) -> Result<HookState> {
     let path = paths::claude_settings_file()?;
     let display = path.to_string_lossy().into_owned();
-    let mut root: Value = if path.exists() {
-        let text = std::fs::read_to_string(&path).with_context(|| format!("reading {display}"))?;
-        if text.trim().is_empty() {
-            json!({})
-        } else {
-            serde_json::from_str(&text).with_context(|| format!("parsing {display}"))?
-        }
-    } else {
-        if let Some(p) = path.parent() {
-            std::fs::create_dir_all(p)?;
-        }
-        json!({})
-    };
+    let mut root = read_settings(&path)?;
 
     let hooks = root
         .as_object_mut()
         .context("settings.json is not a JSON object")?
         .entry("hooks")
         .or_insert_with(|| json!({}));
-    let stop = hooks
+    let list = hooks
         .as_object_mut()
         .context("settings.json `hooks` is not a JSON object")?
-        .entry("Stop")
+        .entry(event)
         .or_insert_with(|| json!([]));
-    let stop = stop
+    let list = list
         .as_array_mut()
-        .context("settings.json `hooks.Stop` is not an array")?;
+        .with_context(|| format!("settings.json `hooks.{event}` is not an array"))?;
 
-    if serde_json::to_string(&stop)?.contains(HOOK_COMMAND) {
+    if entries(list).any(|e| entry_names(e, command)) {
         return Ok(HookState::AlreadyPresent(display));
     }
-    stop.push(json!({ "hooks": [{ "type": "command", "command": HOOK_COMMAND }] }));
-
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(&root)?)?;
-    std::fs::rename(&tmp, &path)?;
+    list.push(json!({ "hooks": [{ "type": "command", "command": command }] }));
+    write_settings(&path, &root)?;
     Ok(HookState::Added(display))
+}
+
+/// Remove every hook entry naming `command` from `hooks.<event>`, and nothing
+/// else. Returns how many were taken out.
+pub fn remove_hook(event: &str, command: &str) -> Result<usize> {
+    let path = paths::claude_settings_file()?;
+    if !path.exists() {
+        return Ok(0);
+    }
+    let mut root = read_settings(&path)?;
+    let Some(list) = root
+        .get_mut("hooks")
+        .and_then(|h| h.get_mut(event))
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(0);
+    };
+    // Drop the inner entries that name our command, and then the group only if
+    // *we* are what emptied it.
+    //
+    // The earlier version dropped any group whose `hooks` array was empty,
+    // which deleted a user's own `{"matcher": "x", "hooks": []}` — a placeholder
+    // they had written deliberately — as a side effect of turning recall off.
+    // This is not our file. Nothing in it is ours to tidy.
+    let mut removed = 0usize;
+    list.retain_mut(|group| {
+        if let Some(inner) = group.get_mut("hooks").and_then(Value::as_array_mut) {
+            let before = inner.len();
+            inner.retain(|h| !entry_names(h, command));
+            let took = before - inner.len();
+            removed += took;
+            !(took > 0 && inner.is_empty())
+        } else if entry_names(group, command) {
+            removed += 1;
+            false
+        } else {
+            true
+        }
+    });
+    if removed > 0 {
+        write_settings(&path, &root)?;
+    }
+    Ok(removed)
+}
+
+pub fn hook_registered(event: &str, command: &str) -> bool {
+    let Ok(path) = paths::claude_settings_file() else {
+        return false;
+    };
+    // A predicate must not create anything. `status` and `doctor` both call
+    // this, and an unconfigured machine used to get a `~/.claude/` directory
+    // out of being asked a question.
+    if !path.exists() {
+        return false;
+    }
+    let Ok(root) = read_settings(&path) else {
+        return false;
+    };
+    root.get("hooks")
+        .and_then(|h| h.get(event))
+        .and_then(Value::as_array)
+        .map(|l| entries(l).any(|e| entry_names(e, command)))
+        .unwrap_or(false)
+}
+
+fn read_settings(path: &std::path::Path) -> Result<Value> {
+    let display = path.to_string_lossy().into_owned();
+    if !path.exists() {
+        return Ok(json!({}));
+    }
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading {display}"))?;
+    if text.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_str(&text).with_context(|| format!("parsing {display}"))
+}
+
+fn write_settings(path: &std::path::Path, root: &Value) -> Result<()> {
+    // The directory is created here rather than in `read_settings`, which is
+    // also reached by predicates that must not have side effects.
+    if let Some(p) = path.parent() {
+        std::fs::create_dir_all(p)?;
+    }
+    // Write-then-rename: this is the user's file and a half-written
+    // settings.json costs them their whole hook configuration, not just ours.
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(root)?)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// Is there already a `tmem` on PATH that is not us?

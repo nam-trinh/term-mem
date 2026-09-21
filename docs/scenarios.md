@@ -2,10 +2,10 @@
 
 Status: scenarios 1 and 2 are Phase 2's acceptance tests and now run as
 integration tests against the real binary (`tests/search.rs`); scenario 3's
-delete-and-reuse path is Phase 3's, in `tests/redaction.rs`. **Scenario 1 runs
-verbatim, ranking included. Scenario 2 runs verbatim except for one sentence,
-corrected in place below.** Scenario 3's deletion half runs; its redaction half
-is Phase 3.
+delete-and-reuse path is Phase 3's, in `tests/redaction.rs`, and its *reuse*
+half is Phase 4's, in `tests/reuse.rs`. **Scenario 1 runs verbatim, ranking
+included. Scenario 2 runs verbatim except for one sentence, corrected in place
+below.** Scenario 3 now runs end to end.
 
 Two gaps surfaced from being executed rather than read: `--since january` needs
 month-name parsing, which [cli.md](cli.md) never specified and which no
@@ -293,8 +293,26 @@ in this form it needs nothing from `tmem` beyond `--json` and a pipe — which i
 one answer to the open question in `cli.md` about whether reuse is a subcommand.
 Terminal-native composition may already cover it.
 
+**As of Phase 4 it does, and three other routes do too.** The pipe still works
+as printed. Beside it: an agent with the MCP server registered finds the
+exchange itself, without Dana having to remember she had the conversation; a
+local model behind Ollama reaches the same three tools through `tmem tools
+--schema openai` and `tmem call`; and `tmem <query> --json | tmem render
+--prompt-block` turns the same JSON into a block to prepend for a model that
+cannot call tools at all.
+
+What the scenario's framing quietly assumes is that Dana pipes *raw JSON* into
+an assistant and it does something sensible with it. That is the part `render`
+exists for, and building it surfaced something this scenario does not mention:
+the block has to say that it is reference material rather than instructions. The
+archive is Dana's own, but an exchange from March that happens to contain
+"ignore all previous instructions" is still a prompt injection with a six-month
+fuse. See [phases/phase-4.md](phases/phase-4.md) finding 6.
+
 **What this scenario tests:** that delete is complete and cheap to invoke under
-stress, and that reuse can be a pipe rather than a feature.
+stress, and that reuse can be a pipe rather than a feature. *(Both hold as of
+Phase 4. The pipe is the minimum, not the ceiling — but nothing that was added
+on top of it made the pipe unnecessary.)*
 
 ---
 
@@ -314,3 +332,9 @@ Read together, three things the current design should decide:
    valve works, but it depends on the user noticing. Most won't. *(Shipped in
    Phase 3 for shapes a rule recognises. What the scenario did not anticipate is
    that the filter has a cost in the other direction — see the note above.)*
+
+A fourth, which only appeared once reuse was built: **an exchange fed back into
+a session is text a model reads as part of its prompt, and the archive is not a
+trusted input just because it is the user's own.** None of these three scenarios
+says so, and all three end in something being pasted or piped into an
+assistant.
