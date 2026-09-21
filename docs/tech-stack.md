@@ -123,7 +123,8 @@ conversations. `thread_id` is derived at ingest by walking to the tree root.
 See [phases/phase-0.md](phases/phase-0.md).
 
 **`source_key` is declared by the adapter, not by the schema.** It holds
-Claude Code's `uuid`; a Codex CLI row will hold a positional key. Uniqueness is
+Claude Code's `uuid`; a Codex CLI row holds `@<line>`, and so does a `tmem run`
+recording. Uniqueness is
 on `(assistant, session_id, source_key)`, which is the idempotency point — a
 re-ingest upserts onto it, so a mid-turn capture completes its row rather than
 adding a second one.
@@ -136,7 +137,11 @@ anything that moved. See [phases/phase-1.md](phases/phase-1.md) finding 5.
 
 **`repo` and `git_branch` are resolved at write time.** Deriving them from
 `cwd` at query time fails the moment a checkout is renamed or deleted, which is
-exactly when old memories matter most.
+exactly when old memories matter most. **Phase 6 made this per-adapter**: Codex
+CLI's `session_meta` carries `repository_url` and `branch` outright, which
+survives a rename that walking up from `cwd` for a `.git` does not. An adapter
+may now supply `repo` itself, and the filesystem walk is the fallback rather
+than the rule. See [phases/phase-6.md](phases/phase-6.md) finding 3.
 
 **Commands get their own table and their own FTS column.** As the scenarios
 show, the extracted command line is the highest-signal region of a response and
@@ -349,12 +354,25 @@ tmem run <assistant> [args…]
 
 `portable-pty` allocates a pty, proxies stdin/stdout so the TUI behaves
 normally, and tees the stream through an ANSI parser (`vte`) that strips escape
-sequences and reconstructs turn boundaries from the prompt pattern the adapter
-declares.
+sequences. ~~and reconstructs turn boundaries from the prompt pattern the
+adapter declares.~~ **Shipped in Phase 6, and the turn detection is not this.**
+Watching a repainting screen for something prompt-shaped is the hard version of
+a problem we do not have: owning the pty means seeing what the user *typed*
+separately from what the program printed, so a turn boundary is the user
+pressing Enter. No prompt regex, none to maintain per REPL.
 
 This is lossy and it's last for a reason: TUIs redraw, spinners emit thousands
-of frames, and turn detection on a repainting screen is heuristic. It's here so
-that "my assistant isn't supported" has an answer, not because it's good.
+of frames, and what sits between two Enters is a render rather than a document.
+It's here so that "my assistant isn't supported" has an answer, not because it's
+good. Two specifics learned by building it: in a pty every `\n` arrives as
+`\r\n`, so carriage return cannot be treated as "erase the line" the way a
+spinner needs; and the terminal echoes input the program has not read yet, so a
+paste puts the next question inside the previous answer. What remains is that a
+REPL answering faster than the quiet window merges two turns, which the tool
+reports rather than hides. See [phases/phase-6.md](phases/phase-6.md) finding 4.
+
+**`tmem run` is an allowlist of three REPLs**, not a way to wrap anything. That
+is the CLI expression of the rule this tier most threatens.
 
 ### Rejected
 
@@ -615,6 +633,13 @@ finding 7.
   capture is data loss; capturing unencrypted is a lie; prompting is impossible
   on a hook. Nothing in these docs chooses, and Phase 3 stopped there. Blocking
   for any future attempt at encryption at rest.
+- **Whether `archived_sessions/` should be ingested.** Codex moves sessions
+  there on its own retention schedule; term-mem skips the directory, so a user
+  whose settings archive aggressively loses history silently. Skipping is the
+  conservative default and it is not obviously right.
+- **Whether the Codex session file is genuinely append-only.** Positional dedup
+  depends on it and the evidence is one compaction event. Carried from
+  [phases/codex-cli-format.md](phases/codex-cli-format.md) unchanged.
 - **Whether an opt-in query log should exist.** Two phases now wait on data
   nothing records: Phase 5's "does keyword search miss things", and Phase 4's
   "is the coverage floor right". [phases/phase-2.md](phases/phase-2.md) noted
@@ -644,7 +669,11 @@ finding 7.
   across 2,665 records), so its only safe key is positional —
   `(file_path, line_number)` over an append-only file. Each adapter must declare
   its own key rather than inheriting `(session_id, uuid)`. Blocking for
-  Phase 6, and it changes the Phase 1 interface.
+  Phase 6, and it changes the Phase 1 interface.~~ **Resolved in Phase 6, and it
+  was three things rather than one.** An adapter declares its dedup key, its
+  injected-block vocabulary, *and where its transcripts are* — the last of which
+  no survey found, because surveys read records and this is a property of
+  directories. `~/.codex` holds three JSONL files that are not transcripts.
 - ~~**Whether the human-prompt discriminator holds outside the VSCode
   entrypoint.** Every Phase 0 session carried `promptSource: "sdk"`; a
   bare-terminal session may use another value or omit the field.~~ **Resolved,

@@ -287,7 +287,17 @@ enqueue and run away. It is held to the 100 ms search budget and **measured at
 
 ---
 
-## Phase 5 — Semantic recall
+## Phase 5 — Semantic recall ⛔
+
+**Blocked, and skipped in favour of Phase 6 on 2026-09-21.** Its Exit criterion
+is "measurably better recall on queries that failed in Phase 2 … if it can't
+beat BM25 on the author's own history, it doesn't ship." There is no such
+history: term-mem has never been run for real, so there is no archive, and no
+query log to say which queries failed. Building it would mean shipping
+embeddings against a gate nothing can pass or fail, which is precisely the
+"shipped for completeness" outcome *What would change this plan* says to avoid.
+**What unblocks it is use, not code** — the soak, and then the opt-in query log
+named below.
 
 *Only now, and only if the archive says it's needed.*
 
@@ -321,7 +331,20 @@ history, it doesn't ship.
 
 ---
 
-## Phase 6 — Beyond Claude Code
+## Phase 6 — Beyond Claude Code ✅
+
+**Done 2026-09-21 — [phases/phase-6.md](phases/phase-6.md).** Verdict: the whole
+scope ships — the interface generalizes, subagent transcripts are captured for
+the first time, Codex CLI ingests with both of its silent traps under regression
+test, and `tmem run` exists as an allowlist rather than a terminal recorder. Two
+things the design did not predict. **Discovery is a third thing that is not
+universal**: `~/.codex` holds three JSONL files that are not transcripts, and a
+`**/*.jsonl` sweep turns the "format may have moved" warning into a permanent
+false alarm — so an adapter now declares where its files are as well as how to
+read them. And **Phase 2's guess about subagent transcripts was wrong in the
+useful direction**: `isSidechain` is on all 445 records, so the four phases of
+"zero sidechain records" were never a parsing problem, only a directory nobody
+walked into.
 
 *Widening capture, once the pipeline is proven against one assistant.*
 
@@ -341,6 +364,12 @@ duplicate event stream that double-counts every response if ingested naively.
 - Generalize the parser interface first, so each adapter declares its own dedup
   key and its own injected-block vocabulary. Phase 1's interface was designed
   against a sample of one and assumes both are universal. They aren't.
+  **Shipped, and it turned out to be three things rather than two** — discovery
+  is per-adapter too, for reasons the survey could not have found because it
+  read records rather than directories. `ParsedExchange` also gained `repo`, so
+  an adapter that is *told* the repository beats the pipeline walking the
+  filesystem for a `.git`: Codex supplies it and the filesystem answer is only
+  right while the checkout is still where it was.
 - **Subagent transcripts, which are a Claude Code adapter gap rather than a new
   vendor.** Phase 2 found them in `<project>/<session>/subagents/agent-*.jsonl`
   — a directory nothing looks in, which is why Phases 0 and 1 both recorded
@@ -357,9 +386,28 @@ adapter. Its real constituency is now clearer: not coding agents, which nearly
 all persist, but the plain-REPL tier — `ollama run`, `llama.cpp -i`, `sgpt` —
 where there is genuinely nothing on disk.
 
+**Shipped, against an allowlist of three REPLs** — the rule above needed a CLI
+expression, and `tmem run bash` refusing is it. One design change:
+[tech-stack.md](tech-stack.md) has the wrapper reconstructing turn boundaries
+from a prompt pattern by watching the repainting screen, and that is the hard
+version of a problem we do not have. Owning the pty means seeing what the user
+*typed* separately from what the program printed, so a turn boundary is the user
+pressing Enter. The response stays lossy, and the tool now reports when it drops
+a turn rather than quietly keeping one of two. See
+[phases/phase-6.md](phases/phase-6.md) finding 4.
+
 **Also here, if wanted:** the interactive picker
 ([cli.md](cli.md)'s third open question) — `ratatui` plus `nucleo` over results,
-as a separate mode rather than the default.
+as a separate mode rather than the default. **Not built.** It was the one
+optional item and nothing in six phases has wanted it.
+
+**Not done, and it is the largest thing outstanding in this project: nobody has
+ever used term-mem.** There is no `~/.local/share/term-mem/memory.db` on the
+author's machine. Phase 1's Exit criterion — "the author runs it against their
+own daily work for two weeks" — has been carried forward for five phases, and
+this is the phase that found out why: it was never started. Six phases of
+features, no day of real use, and no doc recorded the gap. See
+[phases/phase-6.md](phases/phase-6.md).
 
 ---
 
