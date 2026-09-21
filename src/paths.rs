@@ -50,6 +50,12 @@ pub fn recall_config() -> Result<PathBuf> {
     Ok(data_dir()?.join("recall.toml"))
 }
 
+/// Where `tmem run` writes what it records. Under the data directory, because
+/// it is term-mem's own file rather than an assistant's.
+pub fn pty_sessions_dir() -> Result<PathBuf> {
+    Ok(data_dir()?.join("pty"))
+}
+
 /// Claude Code's transcript root.
 pub fn claude_projects_dir() -> Result<PathBuf> {
     if let Some(p) = std::env::var_os("TMEM_CLAUDE_PROJECTS") {
@@ -69,6 +75,15 @@ pub fn claude_config_file() -> Result<PathBuf> {
         return Ok(PathBuf::from(p));
     }
     Ok(home()?.join(".claude.json"))
+}
+
+/// Codex CLI's transcript root. `$TMEM_CODEX_SESSIONS` redirects it, the way
+/// `$TMEM_CLAUDE_PROJECTS` does for the other vendor.
+pub fn codex_sessions_dir() -> Result<PathBuf> {
+    if let Some(p) = std::env::var_os("TMEM_CODEX_SESSIONS") {
+        return Ok(PathBuf::from(p));
+    }
+    Ok(home()?.join(".codex/sessions"))
 }
 
 pub fn claude_settings_file() -> Result<PathBuf> {

@@ -130,6 +130,39 @@ struct Record {
 
 pub struct ClaudeCode;
 
+/// Which kind of Claude Code transcript is being parsed.
+///
+/// The two need opposite rules from the same discriminators, which is why this
+/// is a mode rather than a pile of extra conditions. In a main transcript a
+/// sidechain record is a subagent turn that belongs to the exchange above it,
+/// and an `isMeta` record is an injected caveat. In a subagent transcript
+/// *every* record is sidechain — 445 of 445, measured — and the single `isMeta`
+/// root is the one thing in the file a human caused: the instructions the
+/// parent session handed the agent.
+///
+/// docs/phases/phase-2.md finding 3 guessed that "the inline-`isSidechain`
+/// shape the parser was built for may not be the shape that occurs". It does
+/// occur, universally. What was missing was never the flag; it was the
+/// directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Main,
+    Subagent,
+}
+
+/// A file whose records are *all* sidechain is a subagent transcript.
+///
+/// Decided from the content rather than the path, because the path is a
+/// convention of one Claude Code version and the flag is in every record. An
+/// empty file is `Main`, which parses to nothing either way.
+fn mode_of(records: &[Record]) -> Mode {
+    if !records.is_empty() && records.iter().all(|r| r.is_sidechain == Some(true)) {
+        Mode::Subagent
+    } else {
+        Mode::Main
+    }
+}
+
 impl ClaudeCode {
     /// Finding 2, and the Phase 1 blocking question.
     ///
@@ -140,18 +173,29 @@ impl ClaudeCode {
     /// load-bearing discriminators are the negative ones plus the content shape.
     ///
     /// Returns the prompt text if this record is one, `None` otherwise.
-    fn prompt_text(&self, r: &Record) -> Option<String> {
+    fn prompt_text(&self, r: &Record, mode: Mode) -> Option<String> {
         if r.kind != "user" {
             return None;
         }
         if r.tool_use_result.is_some() {
             return None; // 24 of 41 user records in the Phase 0 sample
         }
-        if r.is_meta == Some(true) || r.is_compact_summary == Some(true) {
-            return None; // local-command caveats; the 14,872-char injected summary
-        }
-        if r.is_sidechain == Some(true) {
-            return None; // subagent turns fold into the parent, never start one
+        if mode == Mode::Subagent {
+            // Exactly one record in a subagent transcript is not machinery: the
+            // `isMeta` root holding the agent's instructions. Everything else is
+            // a tool result — measured across the whole archive, 148 of 158
+            // non-meta user records are `tool_result` blocks and the other 10
+            // carry `toolUseResult`, so this is not a sample of one.
+            if r.is_meta != Some(true) {
+                return None;
+            }
+        } else {
+            if r.is_meta == Some(true) || r.is_compact_summary == Some(true) {
+                return None; // local-command caveats; the 14,872-char injected summary
+            }
+            if r.is_sidechain == Some(true) {
+                return None; // subagent turns fold into the parent, never start one
+            }
         }
         let text = r.message.as_ref()?.content.as_ref()?.text();
         if text.trim().is_empty() {
@@ -187,8 +231,8 @@ impl ClaudeCode {
         Some(stripped.to_string())
     }
 
-    fn is_human_prompt(&self, r: &Record) -> bool {
-        self.prompt_text(r).is_some()
+    fn is_human_prompt(&self, r: &Record, mode: Mode) -> bool {
+        self.prompt_text(r, mode).is_some()
     }
 }
 
@@ -226,7 +270,7 @@ fn tag_body<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
 /// which is right for a record that is pure telemetry and wrong for the common
 /// one that is telemetry followed by a question. Only a properly closed block
 /// is removed — see the unclosed case below.
-fn strip_injected_blocks(text: &str, tags: &[&str]) -> String {
+pub(crate) fn strip_injected_blocks(text: &str, tags: &[&str]) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while !rest.is_empty() {
@@ -303,6 +347,59 @@ impl Adapter for ClaudeCode {
         "claude-code"
     }
 
+    fn transcript_root(&self) -> Result<std::path::PathBuf> {
+        crate::paths::claude_projects_dir()
+    }
+
+    /// `<project>/*.jsonl`, **and** `<project>/<session>/subagents/*.jsonl`.
+    ///
+    /// The second path is the Phase 6 fix for a gap Phase 2 found: nothing had
+    /// ever looked in `subagents/`, which is why Phases 0 and 1 both recorded
+    /// "zero sidechain records" from an archive that contained 445 of them.
+    /// Walking one level deep was never stated as a rule — it was the shape of
+    /// the tree at the time — and the tree grew a floor.
+    fn discover(&self, root: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
+        let mut out = Vec::new();
+        if !root.exists() {
+            return Ok(out);
+        }
+        for project in std::fs::read_dir(root)? {
+            let project = project?;
+            if !project.file_type()?.is_dir() {
+                continue;
+            }
+            for f in std::fs::read_dir(project.path())? {
+                let f = f?;
+                let p = f.path();
+                if p.extension().is_some_and(|e| e == "jsonl") {
+                    out.push(p);
+                    continue;
+                }
+                // <project>/<session>/subagents/agent-*.jsonl
+                if f.file_type()?.is_dir() {
+                    let sub = p.join("subagents");
+                    if !sub.is_dir() {
+                        continue;
+                    }
+                    for a in std::fs::read_dir(&sub)? {
+                        let a = a?.path();
+                        if a.extension().is_some_and(|e| e == "jsonl") {
+                            out.push(a);
+                        }
+                    }
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Claude Code transcripts are `<uuid>.jsonl` — a shape with nothing in it
+    /// to claim on, so this never claims and the registry falls back here.
+    fn claims_path(&self, _path: &std::path::Path) -> bool {
+        false
+    }
+
     fn injected_block_tags(&self) -> &'static [&'static str] {
         INJECTED_TAGS
     }
@@ -346,10 +443,23 @@ impl Adapter for ClaudeCode {
                 }
                 continue;
             }
-            if r.is_sidechain == Some(true) {
-                report.sidechain_records += 1;
-            }
             records.push(r);
+        }
+
+        // The mode is decided once, from the whole file, before any record is
+        // asked whether it is a prompt — the same flag means opposite things in
+        // the two kinds of transcript.
+        let mode = mode_of(&records);
+        if mode == Mode::Subagent {
+            report.subagent_files += 1;
+        } else {
+            // Only meaningful in a main transcript, where it counts subagent
+            // turns inlined among ordinary ones. In a subagent transcript every
+            // record is sidechain and the number would just be the file length.
+            report.sidechain_records += records
+                .iter()
+                .filter(|r| r.is_sidechain == Some(true))
+                .count();
         }
 
         // Second pass. Finding 8: records are not written in parent order —
@@ -370,7 +480,7 @@ impl Adapter for ClaudeCode {
         let mut out: Vec<ParsedExchange> = Vec::new();
         let mut prompt_idx: HashMap<String, usize> = HashMap::new();
         for r in &records {
-            if !self.is_human_prompt(r) {
+            if !self.is_human_prompt(r, mode) {
                 continue;
             }
             report.prompts_found += 1;
@@ -390,6 +500,13 @@ impl Adapter for ClaudeCode {
             };
             prompt_idx.insert(uuid.clone(), out.len());
             out.push(ParsedExchange {
+                // A subagent transcript carries the *parent* session's id, not
+                // one of its own, so these rows sit in the same session as the
+                // conversation that spawned them. That is correct and it is not
+                // a merge: `--session` groups on `thread_id`, which is the root
+                // of the tree, and a subagent file's root is its own `isMeta`
+                // record. Same session, different thread — which is exactly
+                // what a subagent is.
                 session_id: session_id.clone(),
                 thread_id: root_of(&uuid, &parent_of),
                 // Claude Code's dedup key, declared by the adapter rather than
@@ -397,9 +514,12 @@ impl Adapter for ClaudeCode {
                 source_key: DedupKey::Intrinsic(uuid).as_str(),
                 ts_ms: ts,
                 cwd: r.cwd.clone().unwrap_or_default(),
+                // Claude Code does not record the repository, so the pipeline
+                // resolves it from `cwd`.
+                repo: None,
                 git_branch: r.git_branch.clone(),
                 model: None,
-                prompt: self.prompt_text(r).unwrap_or_default(),
+                prompt: self.prompt_text(r, mode).unwrap_or_default(),
                 response: String::new(),
                 commands: Vec::new(),
                 files: Vec::new(),

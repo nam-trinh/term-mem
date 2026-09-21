@@ -5,6 +5,7 @@
 //! one key, two ways of being told to run.
 
 pub mod adapters;
+pub mod pty;
 pub mod queue;
 
 use crate::redact::{Redactor, Report as RedactReport};
@@ -42,6 +43,7 @@ impl IngestStats {
         self.report.prompts_unusable += r.prompts_unusable;
         self.report.api_errors_skipped += r.api_errors_skipped;
         self.report.sidechain_records += r.sidechain_records;
+        self.report.subagent_files += r.subagent_files;
         self.report.orphaned_records += r.orphaned_records;
         self.report.orphaned_chars += r.orphaned_chars;
         for t in r.unknown_types {
@@ -148,10 +150,16 @@ pub fn ingest_file(
             continue;
         }
         session_id.get_or_insert_with(|| ex.session_id.clone());
-        let repo = repos
-            .entry(ex.cwd.clone())
-            .or_insert_with(|| resolve_repo(Path::new(&ex.cwd)))
-            .clone();
+        // An adapter that was told the repository outright wins over walking the
+        // filesystem for a `.git`, because the filesystem answer is only right
+        // while the checkout is still where it was.
+        let repo = match &ex.repo {
+            Some(r) => Some(r.clone()),
+            None => repos
+                .entry(ex.cwd.clone())
+                .or_insert_with(|| resolve_repo(Path::new(&ex.cwd)))
+                .clone(),
+        };
         // Pre-write, and before the idempotency lookup: the stored row is the
         // redacted one, so a re-ingest compares like with like.
         let redactions = redact_exchange(redactor, ex);
@@ -408,27 +416,4 @@ pub fn resolve_repo(cwd: &Path) -> Option<String> {
 
 pub fn is_ignored(cwd: &Path, ignores: &[PathBuf]) -> bool {
     ignores.iter().any(|i| cwd == i || cwd.starts_with(i))
-}
-
-/// Every Claude Code transcript on disk, newest last.
-pub fn claude_transcripts(root: &Path) -> Result<Vec<PathBuf>> {
-    let mut out = Vec::new();
-    if !root.exists() {
-        return Ok(out);
-    }
-    for project in std::fs::read_dir(root)? {
-        let project = project?;
-        if !project.file_type()?.is_dir() {
-            continue;
-        }
-        for f in std::fs::read_dir(project.path())? {
-            let f = f?;
-            let p = f.path();
-            if p.extension().is_some_and(|e| e == "jsonl") {
-                out.push(p);
-            }
-        }
-    }
-    out.sort();
-    Ok(out)
 }

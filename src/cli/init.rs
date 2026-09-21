@@ -2,7 +2,7 @@
 //! be recorded. docs/cli.md: "A tool that silently begins archiving everything
 //! you type is one people uninstall in anger."
 
-use crate::capture::{self, adapters::claude_code::ClaudeCode};
+use crate::capture::{self, adapters};
 use crate::db;
 use crate::paths;
 use anyhow::{Context, Result};
@@ -77,17 +77,15 @@ pub fn run(backfill: bool, no_hook: bool) -> Result<i32> {
     if backfill {
         println!();
         println!("  Backfilling existing transcripts…");
-        let root = paths::claude_projects_dir()?;
-        let files = capture::claude_transcripts(&root)?;
+        let files = adapters::discover_all()?;
         let ignores = crate::cli::ignore::load()?;
-        let adapter = ClaudeCode;
         let redactor = crate::redact::Redactor::load()?;
         let mut total = 0usize;
         let mut failed = 0usize;
-        for f in &files {
+        for (adapter, f) in &files {
             // Log and continue, as `capture` does: one unreadable transcript
             // must not cost the user the other months of history.
-            match capture::ingest_file(&mut conn, &adapter, f, &ignores, true, &redactor) {
+            match capture::ingest_file(&mut conn, *adapter, f, &ignores, true, &redactor) {
                 Ok(s) => total += s.inserted,
                 Err(e) => {
                     eprintln!("tmem: {}: {e:#}", f.display());
