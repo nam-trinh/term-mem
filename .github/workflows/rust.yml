@@ -9,6 +9,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Least privilege for GITHUB_TOKEN. Without this the workflow inherits the
+# repository default, which is usually write access it never uses — flagged by
+# CodeQL as `actions/missing-workflow-permissions`. This job only reads the
+# checkout.
+permissions:
+  contents: read
+
 jobs:
   build:
 

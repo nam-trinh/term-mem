@@ -329,10 +329,14 @@ moved.
   markdown format has none of the structure both JSONL vendors provide.
 - **The interactive picker** ([cli.md](../cli.md)'s third open question) was
   listed as "also here, if wanted". Not built, not wanted yet.
-- **The two-week soak** from Phase 1, still outstanding — and now known to be
+- ~~**The two-week soak** from Phase 1, still outstanding — and now known to be
   outstanding because term-mem has never been installed on the author's machine:
   there is no `~/.local/share/term-mem/memory.db`. Six phases of features and no
   day of real use. That is the largest carried-forward item in this project and
-  it has been invisible because no doc recorded it.
-- **Phase 5 is still blocked** on the same absence, for the same reason. See
-  [plan.md](../plan.md).
+  it has been invisible because no doc recorded it.~~ **Started 2026-09-22 —
+  [soak.md](soak.md)**, which now exists so the next gap of this kind is visible
+  in a document rather than only on the filesystem.
+- **Phase 5 is still blocked**, but on half of what blocked it before. The
+  archive now exists; what does not is any record of what the author searched
+  for, so "which queries failed in Phase 2" remains unanswerable at any archive
+  size. See [plan.md](../plan.md).
