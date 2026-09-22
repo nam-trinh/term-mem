@@ -267,16 +267,18 @@ pub fn doctor() -> Result<i32> {
     let mut discovered: Vec<(&'static str, std::path::PathBuf)> = Vec::new();
     for adapter in crate::capture::adapters::all() {
         let root = adapter.transcript_root()?;
-        let found = if root.exists() {
-            adapter.discover(&root).unwrap_or_default().len()
+        // One walk, not two. `discover` is a recursive read_dir over a whole
+        // archive; doing it once for the count and again for the list doubled
+        // the cost of `doctor` for no reason.
+        let files = if root.exists() {
+            adapter.discover(&root).unwrap_or_default()
         } else {
-            0
+            Vec::new()
         };
+        let found = files.len();
         any += found;
-        if root.exists() {
-            for f in adapter.discover(&root).unwrap_or_default() {
-                discovered.push((adapter.name(), f));
-            }
+        for f in files {
+            discovered.push((adapter.name(), f));
         }
         if found > 0 {
             ok(&format!(

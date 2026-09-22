@@ -334,6 +334,80 @@ pub fn clean_response(raw: &str, prompt: &str, also_typed: &[String]) -> String 
     lines.join("\n").trim().to_string()
 }
 
+/// Run the REPL under a pty and record **nothing** — no session file, no
+/// database write, no bytes on disk anywhere.
+///
+/// Used when capture is paused. Deliberately a separate function rather than a
+/// flag threaded through the recorder: "paused" has to mean nothing was
+/// written, and the way to be sure of that is for there to be no code here that
+/// can write. A temp file that is deleted afterwards would still have existed.
+pub fn run_unrecorded(repl: &Repl, args: &[String]) -> Result<i32> {
+    use portable_pty::{CommandBuilder, PtySize};
+
+    let pty = portable_pty::native_pty_system();
+    let size = terminal_size();
+    let pair = pty.openpty(PtySize {
+        rows: size.0,
+        cols: size.1,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
+
+    let mut cmd = CommandBuilder::new(repl.program);
+    for a in args {
+        cmd.arg(a);
+    }
+    cmd.cwd(std::env::current_dir()?);
+    cmd.env(
+        "TERM",
+        std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()),
+    );
+    cmd.env("TMEM", "0");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .with_context(|| format!("starting `{}`", repl.program))?;
+    drop(pair.slave);
+
+    let mut reader = pair.master.try_clone_reader()?;
+    let reader_thread = std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        let mut stdout = std::io::stdout();
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            let _ = stdout.write_all(&buf[..n]);
+            let _ = stdout.flush();
+        }
+    });
+
+    let mut writer = pair.master.take_writer()?;
+    let _raw = RawMode::enable();
+    std::thread::spawn(move || {
+        let mut stdin = std::io::stdin();
+        let mut buf = [0u8; 1024];
+        while let Ok(n) = stdin.read(&mut buf) {
+            if n == 0 || writer.write_all(&buf[..n]).is_err() {
+                break;
+            }
+            let _ = writer.flush();
+        }
+    });
+
+    let status = child.wait()?;
+    drop(pair.master);
+    let _ = reader_thread.join();
+    drop(_raw);
+    if !status.success() {
+        eprintln!("tmem: `{}` exited with {status:?}", repl.program);
+    }
+    // The REPL's exit status is the REPL's business. `tmem run` succeeded if it
+    // ran the program, the same way `env` or `nice` would.
+    Ok(crate::output::EXIT_OK)
+}
+
 /// Run the REPL under a pty, recording turns to a session file.
 ///
 /// Returns the path written, so the caller can ingest it.
@@ -441,7 +515,14 @@ pub fn run(repl: &Repl, args: &[String]) -> Result<std::path::PathBuf> {
     std::thread::spawn(move || {
         let mut stdin = std::io::stdin();
         let mut buf = [0u8; 1024];
-        let mut line = String::new();
+        // **Bytes, not chars.** `line.push(b as char)` treats each byte as a
+        // codepoint, which turns `concaténer` into `concatÃ©ner` — and the
+        // damage is not cosmetic: the mangled prompt no longer matches the
+        // correctly-decoded echo on screen, so `clean_response` cannot strip it
+        // and the answer is filed under the wrong question. Held as bytes and
+        // decoded once, at the end of the line, where the character boundaries
+        // are known.
+        let mut line: Vec<u8> = Vec::new();
         loop {
             match stdin.read(&mut buf) {
                 Ok(0) | Err(_) => break,
@@ -453,17 +534,22 @@ pub fn run(repl: &Repl, args: &[String]) -> Result<std::path::PathBuf> {
                     for &b in &buf[..n] {
                         match b {
                             b'\r' | b'\n' => {
+                                let text = String::from_utf8_lossy(&line).into_owned();
                                 if let Ok(mut r) = rec2.lock() {
-                                    r.on_user_line(&line);
+                                    r.on_user_line(&text);
                                 }
                                 line.clear();
                             }
                             0x7f | 0x08 => {
-                                line.pop();
+                                // Backspace deletes a *character*, which may be
+                                // several bytes.
+                                while line.pop().is_some_and(|b| b & 0xc0 == 0x80) {}
                             }
                             // Control characters are not part of a question.
+                            // Continuation bytes (0x80..=0xbf) are not control
+                            // characters and must survive this arm.
                             0..=0x1f => {}
-                            _ => line.push(b as char),
+                            _ => line.push(b),
                         }
                     }
                 }
@@ -662,6 +748,37 @@ mod tests {
             clean_response(raw, "joining mp4 files", &["bye".to_string()]),
             "Answer: joining mp4 files is handled by the concat demuxer."
         );
+    }
+
+    /// `line.push(b as char)` treated each byte as a codepoint, so `concaténer`
+    /// was stored as `concatÃ©ner`. Not cosmetic: the mangled prompt no longer
+    /// matches the correctly-decoded echo, so `clean_response` cannot strip it
+    /// and the answer is filed under the wrong question.
+    #[test]
+    fn a_non_ascii_question_is_decoded_rather_than_mangled() {
+        // The byte sequence a terminal actually delivers.
+        let typed = "comment concaténer les fichiers ?".as_bytes();
+        let mut line: Vec<u8> = Vec::new();
+        for &b in typed {
+            match b {
+                0x7f | 0x08 => while line.pop().is_some_and(|b| b & 0xc0 == 0x80) {},
+                0..=0x1f => {}
+                _ => line.push(b),
+            }
+        }
+        let decoded = String::from_utf8_lossy(&line).into_owned();
+        assert_eq!(decoded, "comment concaténer les fichiers ?");
+        assert!(!decoded.contains('Ã'), "mojibake: {decoded}");
+    }
+
+    /// Backspace deletes a character, which may be several bytes. Popping one
+    /// byte leaves a dangling continuation and a replacement character.
+    #[test]
+    fn backspace_removes_a_whole_character_not_a_byte() {
+        let mut line: Vec<u8> = "café".as_bytes().to_vec();
+        while line.pop().is_some_and(|b| b & 0xc0 == 0x80) {}
+        assert_eq!(String::from_utf8_lossy(&line), "caf");
+        assert!(!String::from_utf8_lossy(&line).contains('\u{fffd}'));
     }
 
     /// The allowlist *is* the policy: docs/plan.md's rule is that capture

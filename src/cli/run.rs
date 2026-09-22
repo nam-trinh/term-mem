@@ -36,14 +36,19 @@ pub fn run(repl: Option<String>, args: &[String]) -> Result<i32> {
         );
     };
 
+    // Paused means paused. The first cut printed this line and then recorded
+    // anyway, which is the failure docs/cli.md names in as many words: "one who
+    // believes it's paused when it's recording gets a nasty surprise." Writing
+    // the warning was not the same as honouring it.
     if !crate::cli::pause::capture_enabled() {
         eprintln!(
-            "tmem: capture is paused — running `{}` without recording",
+            "tmem: capture is paused — running `{}` without recording it",
             repl.name
         );
-        // Still run it. Refusing to start the user's program because our
-        // recorder is off would be the tool getting in the way, which is the
-        // one thing a capture layer must never do.
+        // The program still runs. Refusing to start it because our recorder is
+        // off would be the tool getting in the user's way, which is the one
+        // thing a capture layer must never do.
+        return pty::run_unrecorded(repl, args);
     }
 
     let path = pty::run(repl, args)?;

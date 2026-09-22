@@ -237,6 +237,56 @@ Stop hook latency (60 samples, release):
 Nothing in this phase touches the query path, and the third adapter costs the
 `--all` sweep one `read_dir` on a tree that usually does not exist.
 
+## 8. Six defects, and the two methods that found disjoint sets of them
+
+The review of this phase found five bugs by reading the diff. Pointing the
+finished tool at a real archive and reading the output found a sixth that the
+review did not, and could not easily have: **16 of 84 Codex prompts carried an
+unstripped IDE context block**, the largest 6,387 characters of `## Open tabs:`
+stored as if the user had typed it.
+
+That one is worth its own paragraph because of what it is. It is the *fourth*
+time this project has met "injected content is prepended to the record that
+carries the question" — Phase 0 finding 2, Phase 2 finding 1, the Codex survey's
+finding 3 — and the first time the wrapper was not angle brackets. The stripper
+knew a vocabulary of tags. This block is markdown:
+
+```text
+# Context from my IDE setup:
+## Open tabs:
+- README.md: README.md
+## My request for Codex:
+Spawn a subagent to explore this repo.
+```
+
+The lesson the earlier three findings kept stating was "injected-block
+vocabularies are per-adapter". The lesson they were actually teaching is
+narrower and was missed three times: **the wrapper's *shape* is not stable
+either, even within one vendor.** Only the position is — always prepended,
+always with the real question as the tail.
+
+The other three verified findings were all in code written this phase, and two
+of them corrupt an archive rather than merely annoying a user:
+
+- **A reply glued to the previous exchange.** A skipped Codex user record left
+  the current-exchange pointer where it was, so the answer to the skipped
+  question was appended to the row above it. `question ONE` ended up owning
+  `answer TWO`, silently, uncounted. Phase 0 called this failure class out by
+  name: "most traps found so far produce a plausible-looking archive that is
+  wrong."
+- **Every non-ASCII prompt mangled.** `line.push(b as char)` in the PTY tier
+  treats each byte as a codepoint, so `concaténer` became `concatÃ©ner` — and
+  the damage compounds, because the mangled prompt no longer matches the
+  correctly-decoded terminal echo, so the echo is not stripped and the answer
+  is filed under the wrong question.
+- **`tmem run` recorded while paused**, after printing "capture is paused —
+  running without recording". [cli.md](../cli.md) names this exact failure:
+  "one who believes it's paused when it's recording gets a nasty surprise."
+  Writing that warning was not the same as honouring it, and the fix is a
+  genuinely separate no-record code path rather than a flag — "paused" has to
+  mean nothing was written, and the way to be sure is for there to be no code
+  that can write.
+
 ## Verdict
 
 **The scope ships.** The interface generalizes and has two more implementations
@@ -256,6 +306,10 @@ moved.
 
 ## Carried forward
 
+- **The injected-block stripper is still a list of known shapes.** Two
+  vocabularies and two syntaxes now, found one at a time, each after it had
+  already polluted an archive. Nothing detects an unrecognised wrapper; the
+  only signal is a human reading prompts and noticing they are not prompts.
 - **`archived_sessions/` is not ingested**, deliberately. If a user's Codex
   retention settings move sessions there, term-mem stops seeing them, and
   nothing says so.

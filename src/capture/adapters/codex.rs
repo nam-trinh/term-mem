@@ -40,6 +40,48 @@ const INJECTED_TAGS: &[&str] = &[
     "user_instructions",
 ];
 
+/// The IDE integration wraps the user's question in **markdown**, not a tag:
+///
+/// ```text
+/// # Context from my IDE setup:
+///
+/// ## Active file: README.md
+///
+/// ## Open tabs:
+/// - README.md: README.md
+///
+/// ## My request for Codex:
+/// Spawn a subagent to explore this repo.
+/// ```
+///
+/// Found by reading the archive rather than the code: 16 of 84 Codex prompts
+/// carried one, the largest 6,387 characters of it, all of it stored as if the
+/// user had typed it. It is the fourth time this project has met "injected
+/// content is prepended to the record that carries the question" — Phase 0
+/// finding 2, Phase 2 finding 1, the Codex survey's finding 3 — and the first
+/// time the wrapper was not angle brackets, which is precisely why the
+/// tag-shaped stripper sailed past it.
+///
+/// The question is the tail after the request marker. A block with no marker is
+/// all context and starts nothing.
+const IDE_CONTEXT_OPENER: &str = "# Context from my IDE setup:";
+const IDE_REQUEST_MARKERS: &[&str] = &["## My request for Codex:", "## My request:"];
+
+/// Returns the real question from an IDE-wrapped prompt, or `None` if the text
+/// is not one.
+fn strip_ide_context(text: &str) -> Option<String> {
+    if !text.trim_start().starts_with(IDE_CONTEXT_OPENER) {
+        return None;
+    }
+    for marker in IDE_REQUEST_MARKERS {
+        if let Some(i) = text.find(marker) {
+            return Some(text[i + marker.len()..].trim().to_string());
+        }
+    }
+    // Opened but never asked anything: the whole record is context.
+    Some(String::new())
+}
+
 /// Top-level `type` values that are conversation. Everything else is either the
 /// duplicate UI stream or per-turn bookkeeping.
 const CONVERSATION: &str = "response_item";
@@ -54,6 +96,14 @@ const KNOWN_IGNORED: &[&str] = &[
     "compacted",     // finding 6: a history rewrite, not new conversation
     "response.done", // usage accounting, new since the survey
     "event",         // seen in newer builds alongside event_msg
+];
+
+/// `payload.type` values under `response_item` that are known and carry nothing
+/// we store. Anything outside this list *and* the match arms above is reported.
+const KNOWN_IGNORED_PAYLOADS: &[&str] = &[
+    "function_call_output",
+    "custom_tool_call_output",
+    "web_search_call",
 ];
 
 #[derive(Debug, Deserialize)]
@@ -184,11 +234,25 @@ impl Adapter for Codex {
                         "developer" | "system" => continue,
                         "user" => {
                             let text = content_text(payload);
+                            let text = match strip_ide_context(&text) {
+                                Some(question) => question,
+                                None => text,
+                            };
                             let stripped =
                                 super::claude_code::strip_injected_blocks(&text, INJECTED_TAGS);
                             let stripped = stripped.trim();
                             if stripped.is_empty() {
-                                continue; // the record was nothing but injected context
+                                // The record was nothing but injected context —
+                                // but it was still a *turn*, and the assistant
+                                // is about to answer it. Forgetting that closes
+                                // the previous exchange's response with this
+                                // one's answer appended to it: "question ONE"
+                                // ended up owning "answer TWO", silently and
+                                // uncounted, which is the plausible-looking-
+                                // but-wrong archive this project exists to
+                                // avoid.
+                                current = None;
+                                continue;
                             }
                             report.prompts_found += 1;
                             let Some(ts) = ts else {
@@ -198,6 +262,7 @@ impl Adapter for Codex {
                                     i + 1
                                 );
                                 report.prompts_unusable += 1;
+                                current = None;
                                 continue;
                             };
                             current = Some(out.len());
@@ -263,7 +328,20 @@ impl Adapter for Codex {
                     // Finding 4: empty on disk, in both vendors. Nothing to do,
                     // and nothing to store even if it were not.
                 }
-                _ => {}
+                other => {
+                    // The nested discriminator needs the same alarm as the
+                    // top-level one. Without it a rename of `function_call`
+                    // stops command mining permanently and `doctor` reports
+                    // nothing — the format moves and the archive just quietly
+                    // gets thinner.
+                    if !KNOWN_IGNORED_PAYLOADS.contains(&other) {
+                        report.records_unknown_type += 1;
+                        let label = format!("response_item/{other}");
+                        if !report.unknown_types.contains(&label) {
+                            report.unknown_types.push(label);
+                        }
+                    }
+                }
             }
         }
 
@@ -565,6 +643,100 @@ mod tests {
         assert_eq!(ex.len(), 1, "compaction did not re-ingest its history");
         assert_eq!(report.records_unknown_type, 1);
         assert_eq!(report.unknown_types, vec!["brand_new_thing"]);
+    }
+
+    /// Found by reading a real archive rather than the code: 16 of 84 Codex
+    /// prompts carried an IDE context block, the largest 6,387 characters, all
+    /// stored as if the user had typed it. The tag-shaped stripper missed it
+    /// because this wrapper is markdown.
+    #[test]
+    fn the_ide_context_wrapper_is_stripped_to_the_question() {
+        let text = "# Context from my IDE setup:\n\n## Active file: README.md\n\n\
+                    ## Open tabs:\n- README.md: README.md\n\n\
+                    ## My request for Codex:\nSpawn a subagent to explore this repo.\n";
+        assert_eq!(
+            strip_ide_context(text).as_deref(),
+            Some("Spawn a subagent to explore this repo.")
+        );
+        // Ordinary prompts are untouched, including ones that merely mention it.
+        assert_eq!(strip_ide_context("why is the build slow"), None);
+        assert_eq!(strip_ide_context("what is my IDE setup?"), None);
+        // Opened but never asked: the record is all context and starts nothing.
+        assert_eq!(
+            strip_ide_context("# Context from my IDE setup:\n\n## Open tabs:\n- a.rs").as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn an_ide_wrapped_prompt_survives_the_whole_parse() {
+        let wrapped = "# Context from my IDE setup:\n\n## Open tabs:\n- a.rs: a.rs\n\n\
+                       ## My request for Codex:\nwhy does the migration lock the table";
+        let body = format!(
+            "{}\n{}\n{}\n",
+            r#"{"timestamp":"2026-03-01T10:00:00.000Z","type":"session_meta","payload":{"id":"s1","cwd":"/home/dev"}}"#,
+            serde_json::json!({
+                "timestamp":"2026-03-01T10:00:01.000Z","type":"response_item",
+                "payload":{"type":"message","role":"user",
+                           "content":[{"type":"input_text","text":wrapped}]}
+            }),
+            r#"{"timestamp":"2026-03-01T10:00:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"It rewrites every row."}]}}"#
+        );
+        let (ex, _) = parse(&body);
+        assert_eq!(ex.len(), 1);
+        assert_eq!(ex[0].prompt, "why does the migration lock the table");
+        assert!(!ex[0].prompt.contains("Open tabs"), "{:?}", ex[0].prompt);
+    }
+
+    /// A skipped user record is still a *turn*. Forgetting that closed the
+    /// previous exchange with this one's answer glued on — silently, and
+    /// uncounted, which is the plausible-looking-but-wrong archive this project
+    /// exists to avoid.
+    #[test]
+    fn an_answer_to_a_skipped_question_is_never_glued_to_the_previous_one() {
+        let body = r#"{"timestamp":"2026-03-01T10:00:00.000Z","type":"session_meta","payload":{"id":"s1","cwd":"/home/dev"}}
+{"timestamp":"2026-03-01T10:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"question ONE"}]}}
+{"timestamp":"2026-03-01T10:00:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer ONE"}]}}
+{"timestamp":"2026-03-01T10:00:03.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<turn_aborted>only injected</turn_aborted>"}]}}
+{"timestamp":"2026-03-01T10:00:04.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer TWO belongs elsewhere"}]}}
+"#;
+        let (ex, report) = parse(body);
+        assert_eq!(ex.len(), 1);
+        assert_eq!(ex[0].response, "answer ONE", "{:?}", ex[0].response);
+        assert!(
+            !ex[0].response.contains("answer TWO"),
+            "{:?}",
+            ex[0].response
+        );
+        // And the stranded answer is counted rather than absorbed.
+        assert_eq!(report.orphaned_records, 1);
+    }
+
+    /// The nested discriminator needs the same alarm as the top-level one: a
+    /// rename of `function_call` would stop command mining permanently, and
+    /// nothing would say so.
+    #[test]
+    fn an_unknown_nested_payload_type_is_reported() {
+        let body = r#"{"timestamp":"2026-03-01T10:00:00.000Z","type":"session_meta","payload":{"id":"s1","cwd":"/home/dev"}}
+{"timestamp":"2026-03-01T10:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"a question"}]}}
+{"timestamp":"2026-03-01T10:00:02.000Z","type":"response_item","payload":{"type":"shell_call_v2","name":"shell"}}
+{"timestamp":"2026-03-01T10:00:03.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"an answer"}]}}
+"#;
+        let (ex, report) = parse(body);
+        assert_eq!(ex.len(), 1);
+        assert_eq!(report.unknown_types, vec!["response_item/shell_call_v2"]);
+        // …and the ones we know to ignore stay silent.
+        let quiet = r#"{"timestamp":"2026-03-01T10:00:00.000Z","type":"session_meta","payload":{"id":"s1","cwd":"/home/dev"}}
+{"timestamp":"2026-03-01T10:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"q"}]}}
+{"timestamp":"2026-03-01T10:00:02.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c","output":"x"}}
+{"timestamp":"2026-03-01T10:00:03.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"a"}]}}
+"#;
+        let (_, report) = parse(quiet);
+        assert!(
+            report.unknown_types.is_empty(),
+            "{:?}",
+            report.unknown_types
+        );
     }
 
     /// Discovery is the trap the survey missed: `~/.codex` holds JSONL that is

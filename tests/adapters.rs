@@ -513,3 +513,193 @@ fn a_live_pty_session_records_the_turns_a_user_typed() {
         "the queued line leaked: {response:?}"
     );
 }
+
+// ── Regressions from the Phase 6 review, and from using the thing ────────
+
+/// docs/cli.md: "one who believes it's paused when it's recording gets a nasty
+/// surprise." `tmem run` printed exactly that reassurance and then recorded —
+/// the session file, the database row, all of it.
+#[test]
+fn run_records_nothing_at_all_while_capture_is_paused() {
+    let e = Env::new();
+    e.cmd().args(["init", "--no-hook"]).assert().success();
+    let bin = fake_repl(&e);
+    e.cmd().args(["pause"]).assert().success();
+
+    let out = e
+        .cmd()
+        .env("PATH", with_path(&bin))
+        .args(["run", "sgpt"])
+        .write_stdin("how do I join mp4 files\nbye\n")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8(out.stderr)
+            .unwrap()
+            .contains("without recording"),
+        "it must say so"
+    );
+
+    assert_eq!(e.count("exchanges"), 0, "recorded while paused");
+    // And nothing on disk either — a session file deleted afterwards would
+    // still have existed.
+    let pty_dir = e.data().join("pty");
+    let left = std::fs::read_dir(&pty_dir).map(|d| d.count()).unwrap_or(0);
+    assert_eq!(left, 0, "a recording was written while paused");
+
+    // Resumed, it records again.
+    e.cmd().args(["resume"]).assert().success();
+    e.cmd()
+        .env("PATH", with_path(&bin))
+        .args(["run", "sgpt"])
+        .write_stdin("how do I join mp4 files\nbye\n")
+        .output()
+        .unwrap();
+    assert_eq!(e.count("exchanges"), 1);
+}
+
+/// `line.push(b as char)` stored `concaténer` as `concatÃ©ner`, and the mangled
+/// prompt then failed to match the correctly-decoded echo, so the answer was
+/// filed under the wrong question.
+#[test]
+fn a_non_ascii_question_survives_a_live_pty_session() {
+    let e = Env::new();
+    e.cmd().args(["init", "--no-hook"]).assert().success();
+    let bin = fake_repl(&e);
+
+    e.cmd()
+        .env("PATH", with_path(&bin))
+        .args(["run", "sgpt"])
+        .write_stdin("comment concaténer les fichiers mp4 ?\nbye\n")
+        .output()
+        .unwrap();
+
+    let prompt = e.query("SELECT prompt FROM exchanges").remove(0);
+    assert_eq!(prompt, "comment concaténer les fichiers mp4 ?");
+    assert!(
+        !prompt.contains('Ã'),
+        "mojibake reached the archive: {prompt}"
+    );
+
+    // And the echo was still stripped, which the mangling used to prevent.
+    let response = e.query("SELECT response FROM exchanges").remove(0);
+    assert!(!response.contains("concaténer"), "echo leaked: {response}");
+    assert!(response.contains("concat demuxer"), "{response}");
+}
+
+/// Found by reading a real archive, not by reading the diff: 16 of 84 Codex
+/// prompts carried an IDE context block, the largest 6,387 characters of it.
+/// The stripper knew about angle brackets; this wrapper is markdown.
+#[test]
+fn an_ide_context_block_never_reaches_the_archive() {
+    let e = Env::new();
+    codex_env(&e).args(["init", "--no-hook"]).assert().success();
+    let path = e.home().join("codex/sessions/2026/03/01/rollout-ide.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let wrapped = "# Context from my IDE setup:\n\n## Active file: README.md\n\n\
+                   ## Open tabs:\n- README.md: README.md\n\n\
+                   ## My request for Codex:\nwhy does the migration lock the table";
+    std::fs::write(
+        &path,
+        format!(
+            "{}\n{}\n{}\n",
+            r#"{"timestamp":"2026-03-01T10:00:00.000Z","type":"session_meta","payload":{"id":"s1","cwd":"/home/dev"}}"#,
+            serde_json::json!({
+                "timestamp": "2026-03-01T10:00:01.000Z", "type": "response_item",
+                "payload": {"type":"message","role":"user",
+                            "content":[{"type":"input_text","text":wrapped}]}
+            }),
+            r#"{"timestamp":"2026-03-01T10:00:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"It rewrites every row in one transaction."}]}}"#
+        ),
+    )
+    .unwrap();
+
+    codex_env(&e).args(["capture", "--all"]).assert().success();
+    let prompt = e.query("SELECT prompt FROM exchanges").remove(0);
+    assert_eq!(prompt, "why does the migration lock the table");
+    assert!(!prompt.contains("Open tabs"), "{prompt}");
+    assert!(!prompt.contains("Active file"), "{prompt}");
+}
+
+/// A skipped Codex user record left `current` pointing at the previous
+/// exchange, so the next answer was appended to it — silently, and uncounted.
+#[test]
+fn a_reply_to_a_skipped_codex_question_does_not_land_on_the_previous_row() {
+    let e = Env::new();
+    codex_env(&e).args(["init", "--no-hook"]).assert().success();
+    let path = e
+        .home()
+        .join("codex/sessions/2026/03/01/rollout-skip.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        r#"{"timestamp":"2026-03-01T10:00:00.000Z","type":"session_meta","payload":{"id":"s1","cwd":"/home/dev"}}
+{"timestamp":"2026-03-01T10:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"question ONE"}]}}
+{"timestamp":"2026-03-01T10:00:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer ONE"}]}}
+{"timestamp":"2026-03-01T10:00:03.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<turn_aborted>only injected</turn_aborted>"}]}}
+{"timestamp":"2026-03-01T10:00:04.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer TWO belongs elsewhere"}]}}
+"#,
+    )
+    .unwrap();
+
+    codex_env(&e).args(["capture", "--all"]).assert().success();
+    assert_eq!(e.count("exchanges"), 1);
+    let response = e.query("SELECT response FROM exchanges").remove(0);
+    assert_eq!(response, "answer ONE", "{response}");
+}
+
+/// A `payload.type` nobody recognises must reach the user. Without it, a rename
+/// of `function_call` stops command mining permanently and `doctor` says
+/// nothing.
+#[test]
+fn an_unknown_codex_payload_type_is_reported_to_the_user() {
+    let e = Env::new();
+    codex_env(&e).args(["init", "--no-hook"]).assert().success();
+    let path = e.home().join("codex/sessions/2026/03/01/rollout-new.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        r#"{"timestamp":"2026-03-01T10:00:00.000Z","type":"session_meta","payload":{"id":"s1","cwd":"/home/dev"}}
+{"timestamp":"2026-03-01T10:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"run the tests"}]}}
+{"timestamp":"2026-03-01T10:00:02.000Z","type":"response_item","payload":{"type":"shell_call_v2","name":"shell"}}
+{"timestamp":"2026-03-01T10:00:03.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"All green."}]}}
+"#,
+    )
+    .unwrap();
+
+    codex_env(&e)
+        .args(["capture", "--all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("response_item/shell_call_v2"));
+}
+
+/// The fake REPL used by the pty tests, and the PATH that finds it.
+fn fake_repl(e: &Env) -> PathBuf {
+    let dir = e.home().join("bin");
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("sgpt");
+    std::fs::write(
+        &f,
+        "#!/bin/sh\nprintf '>>> '\nwhile IFS= read -r line; do\n  \
+         [ \"$line\" = bye ] && exit 0\n  \
+         printf 'Answer: use the concat demuxer with -c copy.\\n>>> '\n\
+         done\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    dir
+}
+
+fn with_path(dir: &Path) -> String {
+    format!(
+        "{}:{}",
+        dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
