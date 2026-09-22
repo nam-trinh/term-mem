@@ -67,12 +67,15 @@ enum Command {
         /// Ingest one transcript file
         #[arg(long, value_name = "FILE")]
         path: Option<PathBuf>,
-        /// Ingest every transcript on disk
+        /// Ingest every transcript on disk, for every assistant
         #[arg(long)]
         all: bool,
         /// Say nothing on success
         #[arg(long)]
         quiet: bool,
+        /// Which adapter owns `--path`, when the filename cannot say
+        #[arg(long, value_name = "NAME")]
+        assistant: Option<String>,
     },
     /// Search the archive — the explicit form of the default verb
     Search {
@@ -175,6 +178,14 @@ enum Command {
         #[arg(long)]
         hook: bool,
     },
+    /// Record a REPL that keeps no transcript of its own (lossy; last resort)
+    Run {
+        /// Which REPL: run `tmem run` with no arguments to list them
+        repl: Option<String>,
+        /// Arguments passed straight through to it
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Permanently delete an exchange
     Forget {
         id: Option<String>,
@@ -226,7 +237,8 @@ fn run() -> anyhow::Result<i32> {
             path,
             all,
             quiet,
-        } => cli::capture_cmd::run(hook, drain, path, all, quiet),
+            assistant,
+        } => cli::capture_cmd::run(hook, drain, path, all, quiet, assistant),
         Command::Search { query, browse } => cli::search::run(&query, &browse),
         Command::Export { markdown, browse } => {
             let format = if markdown {
@@ -272,6 +284,7 @@ fn run() -> anyhow::Result<i32> {
             _ if !query.is_empty() => cli::recall::preview(&query),
             _ => cli::recall::status(),
         },
+        Command::Run { repl, args } => cli::run::run(repl, &args),
         Command::Forget {
             id,
             last,

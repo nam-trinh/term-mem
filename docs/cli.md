@@ -1,8 +1,10 @@
 # term-mem — CLI surface
 
-Status: Phases 1 to 4 shipped, so searching, browsing, capture control,
-deletion, data ownership and reuse are all now *as implemented* rather than as
-sketched. Anything not yet built is marked with the phase that owns it.
+Status: Phases 1 to 4 and 6 shipped, so searching, browsing, capture control,
+deletion, data ownership, reuse and multi-assistant capture are all now *as
+implemented* rather than as sketched. Phase 5 (semantic recall) is blocked
+rather than built — see [plan.md](plan.md). Anything not yet built is marked
+with the phase that owns it.
 
 ## Name
 
@@ -52,7 +54,9 @@ behaves surprisingly. Keep the set small, stable, and made of words nobody
 searches for.
 
 Phase 4 spent some of that budget: `mcp`, `tools`, `call`, `render` and `recall`
-are now reserved, and `tools` and `call` are ordinary English. `tmem call` is a
+are now reserved, and `tools` and `call` are ordinary English. Phase 6 added
+`run`, which is worse than either — but it is the name `tech-stack.md` gives the
+PTY tier and `tmem search run` still works. `tmem call` is a
 usage error, not a search for the word. `tmem search call` is the escape hatch
 and always was — but this is the first time a reserved word has had a meaning,
 and the list should not grow again without a reason as good as "the tech stack
@@ -328,6 +332,62 @@ Exchanges from the session doing the asking are never replayed back to it.
 coverage and score for each, so the setting can be tuned against a real archive
 instead of guessed at.
 
+### Assistants (Phase 6)
+
+Capture is not Claude-Code-only. Each adapter declares three things the others
+cannot assume: where its transcripts live, how it identifies a record for
+idempotency, and which injected blocks to strip out of a prompt.
+
+| Adapter | Transcripts | Dedup key | Env override |
+| --- | --- | --- | --- |
+| `claude-code` | `~/.claude/projects/<project>/*.jsonl` and `<session>/subagents/*.jsonl` | the record `uuid` | `TMEM_CLAUDE_PROJECTS` |
+| `codex-cli` | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | `@<line>` — no record carries an id | `TMEM_CODEX_SESSIONS` |
+| `pty` | what `tmem run` recorded, under the data directory | `@<line>` | — |
+
+`tmem capture --all` sweeps all of them. A tree that does not exist is normal
+and `doctor` reports it as a note rather than a problem — most machines have one
+assistant installed, not three.
+
+**Subagent transcripts** are captured as of Phase 6. Each one becomes a single
+exchange: the instructions the parent session gave the agent, and what the agent
+concluded. They carry the parent's session id but their own `thread_id`, so
+`tmem show <id> --session` shows the agent's conversation rather than merging it
+into the one that spawned it.
+
+`codex-cli` rows carry `repo` and `git_branch` straight from the transcript
+rather than from a filesystem walk, so they still resolve after the checkout is
+renamed or deleted.
+
+### Recording a REPL (Phase 6)
+
+```
+tmem run                        list the REPLs this can record
+tmem run <repl> [args…]         run it under a pty and record the turns
+```
+
+The last tier and the worst one. It exists for `ollama run`, `llama.cpp -i` and
+`sgpt` — the plain-REPL tier, where there is genuinely nothing on disk. Every
+coding agent surveyed so far writes a transcript, and for those this path is
+strictly worse than the adapter that reads it.
+
+**It takes a name from a fixed list and refuses everything else.** That is the
+CLI expression of the rule in [mission.md](mission.md) and
+[plan.md](plan.md): term-mem never watches your terminal, and `tmem run bash` is
+not an oversight to be fixed.
+
+```
+$ tmem run bash
+tmem: `tmem run bash` is not supported; known REPLs are ollama, llama-cli, sgpt.
+  term-mem never watches the terminal — a program needs an explicit adapter,
+  and adding one is a code change rather than a flag.
+```
+
+What it records is lossy and says so. Turn boundaries are reliable — they come
+from what you typed, not from parsing the screen — but the response is a render
+of a repainting terminal. When a REPL answers faster than the turn detector can
+separate two answers, the command reports the gap rather than quietly keeping
+one of two.
+
 ### Data ownership
 
 ```
@@ -371,7 +431,8 @@ tmem doctor                     is capture actually wired up?
 tmem capture --hook <assistant> the Stop hook itself; reads its payload on stdin
 tmem capture --drain            process whatever the hook queued
 tmem capture --path <file>      ingest one transcript, synchronously
-tmem capture --all              ingest every transcript on disk
+tmem capture --path <f> --assistant <name>   …when the filename cannot say whose
+tmem capture --all              ingest every transcript, for every assistant
 ```
 
 `init` edits the `Stop` hooks in `~/.claude/settings.json` in place, preserving

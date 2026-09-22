@@ -6,6 +6,7 @@ pub mod init;
 pub mod pause;
 pub mod recall;
 pub mod render;
+pub mod run;
 pub mod search;
 pub mod show;
 pub mod status;

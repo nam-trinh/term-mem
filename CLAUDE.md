@@ -51,8 +51,9 @@ running them concurrently measures the disk rather than the program — and both
 skip in a debug build, where the numbers mean nothing. Unit tests sit beside the code; `tests/` drives the real binary against
 a temp database, and `tests/search.rs` runs scenarios 1 and 2 verbatim. Fixtures are in `tests/fixtures/<adapter>/` — real record *shapes*,
 synthetic content, one per finding in `docs/phases/`. `TMEM_HOME`,
-`TMEM_CLAUDE_PROJECTS` and `TMEM_CLAUDE_SETTINGS` redirect the data directory
-and transcript tree; use them for anything run by hand.
+`TMEM_CLAUDE_PROJECTS`, `TMEM_CLAUDE_SETTINGS`, `TMEM_CLAUDE_CONFIG` and
+`TMEM_CODEX_SESSIONS` redirect the data directory and the transcript trees; use
+them for anything run by hand.
 
 ## Layout
 
@@ -61,6 +62,7 @@ and forward-only refinery migrations · `src/capture/` ingest, hook queue, and
 `adapters/` · `src/search/` FTS5 match building and BM25 ranking ·
 `src/redact/` pre-write pattern rules and the user rule file ·
 `src/mcp/` the three agent tools and a hand-rolled JSON-RPC stdio server ·
+`src/capture/pty.rs` the lossy REPL recorder ·
 `src/output.rs` pipe detection, exit codes, formatting.
 
 `exchanges_fts` is maintained by triggers on `exchanges`, not by the write path.
@@ -89,6 +91,13 @@ added, and never tidy anything adjacent. A config file that will not parse is
 fatal only where continuing would be worse than stopping — true for
 `redact.toml`, false for `recall.toml` (finding 9).
 
-Adapters declare their own dedup key and injected-block vocabulary; neither is
-universal — see `src/capture/adapters/mod.rs` and
-[codex-cli-format.md](docs/phases/codex-cli-format.md).
+Adapters declare **three** things, none of them universal: their dedup key,
+their injected-block vocabulary, and *where their transcripts are*. See
+`src/capture/adapters/mod.rs`, [codex-cli-format.md](docs/phases/codex-cli-format.md)
+and [phase-6.md](docs/phases/phase-6.md) finding 1. Three ship —
+`claude-code`, `codex-cli`, `pty` — and `adapters::all()` is the registry; do
+not name a concrete adapter at a call site.
+
+**`tmem run` is an allowlist, not a wrapper.** The rule it threatens is the
+project's oldest: term-mem never watches the terminal, and capture happens only
+from programs with an explicit adapter. Adding one is a code change.

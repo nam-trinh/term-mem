@@ -22,6 +22,16 @@ finding.
 Storage shapes shown below are illustrative. What matters is which fields the
 retrieval path actually depends on.
 
+All three scenarios say "the assistant" and mean Claude Code, because that is
+what existed when they were written. As of Phase 6 the archive holds Codex CLI
+and subagent transcripts too, and every line below runs the same — which is the
+point of the adapter interface and is worth stating rather than assuming. The
+one place a second vendor *changes* a scenario is scenario 2: Codex records
+`repo` and `git_branch` in the transcript, so `--repo` still resolves after the
+checkout Marcus was working in has been renamed. For a Claude Code row it does
+not, because the repository is recovered by walking up from `cwd` for a `.git`
+that may no longer be there.
+
 ---
 
 ## Scenario 1 — The half-remembered incantation

@@ -6,7 +6,7 @@
 //! * `--path <file>`       synchronous ingest of one transcript, and
 //!   `--all` for every transcript on disk. Tests and `init --backfill` use it.
 
-use crate::capture::{self, adapters::claude_code::ClaudeCode, queue};
+use crate::capture::{self, adapters, queue};
 use crate::cli::pause;
 use crate::db;
 use crate::output::{EXIT_ERROR, EXIT_OK};
@@ -21,6 +21,7 @@ pub fn run(
     path: Option<PathBuf>,
     all: bool,
     quiet: bool,
+    assistant: Option<String>,
 ) -> Result<i32> {
     if let Some(assistant) = hook {
         return run_hook(&assistant);
@@ -29,12 +30,21 @@ pub fn run(
         return run_drain(quiet);
     }
     if let Some(p) = path {
-        return run_paths(&[p], true, quiet);
+        // One file, no tree around it to say whose it is. `--assistant`
+        // overrides the guess; without it the filename decides, and Claude Code
+        // is the fallback because its transcripts have no claimable shape.
+        let adapter = match assistant.as_deref() {
+            Some(name) => adapters::by_name(name).ok_or_else(|| {
+                anyhow::anyhow!("unknown assistant '{name}'; known: {}", adapters::names())
+            })?,
+            None => adapters::for_path(&p),
+        };
+        return run_paths(&[(adapter, p)], true, quiet);
     }
     if all {
-        // --all sweeps the archive and honours the watermark, so a rerun over
-        // months of transcripts costs one stat per unchanged file.
-        let files = capture::claude_transcripts(&paths::claude_projects_dir()?)?;
+        // --all sweeps every adapter's tree and honours the watermark, so a
+        // rerun over months of transcripts costs one stat per unchanged file.
+        let files = adapters::discover_all()?;
         return run_paths(&files, false, quiet);
     }
     anyhow::bail!("tmem capture: give --hook <assistant>, --drain, --path <file>, or --all")
@@ -42,9 +52,10 @@ pub fn run(
 
 /// The hot path. Everything expensive is deliberately downstream of this.
 fn run_hook(assistant: &str) -> Result<i32> {
-    if assistant != "claude-code" {
+    if adapters::by_name(assistant).is_none() {
         anyhow::bail!(
-            "unknown assistant '{assistant}'; Phase 1 ships the claude-code adapter only"
+            "unknown assistant '{assistant}'; known: {}",
+            adapters::names()
         );
     }
     // TMEM=0 and pause are checked before anything is written, and both are
@@ -124,11 +135,15 @@ fn run_drain(quiet: bool) -> Result<i32> {
         }
         drained_any = true;
         // Collapse repeats: several turns in one session queue the same file.
-        let mut paths_seen: Vec<PathBuf> = Vec::new();
+        let mut paths_seen: Vec<(&'static dyn adapters::Adapter, PathBuf)> = Vec::new();
         for (_, item) in &items {
             let p = PathBuf::from(&item.transcript_path);
-            if !paths_seen.contains(&p) {
-                paths_seen.push(p);
+            // The queue entry names the assistant whose hook wrote it, which is
+            // better evidence than the filename.
+            let adapter =
+                adapters::by_name(&item.assistant).unwrap_or_else(|| adapters::for_path(&p));
+            if !paths_seen.iter().any(|(_, q)| q == &p) {
+                paths_seen.push((adapter, p));
             }
         }
         if run_paths(&paths_seen, true, quiet)? != EXIT_OK {
@@ -144,18 +159,21 @@ fn run_drain(quiet: bool) -> Result<i32> {
     Ok(code)
 }
 
-fn run_paths(files: &[PathBuf], force: bool, quiet: bool) -> Result<i32> {
+fn run_paths(
+    files: &[(&'static dyn adapters::Adapter, PathBuf)],
+    force: bool,
+    quiet: bool,
+) -> Result<i32> {
     let mut conn = db::open(&paths::db_path()?)?;
     let ignores = crate::cli::ignore::load()?;
-    let adapter = ClaudeCode;
     // Loaded once per run, not per file: a malformed user rule file is fatal
     // here rather than partway through an archive.
     let redactor = crate::redact::Redactor::load()?;
     let mut total = capture::IngestStats::default();
     let mut failed = 0;
 
-    for f in files {
-        match capture::ingest_file(&mut conn, &adapter, f, &ignores, force, &redactor) {
+    for (adapter, f) in files {
+        match capture::ingest_file(&mut conn, *adapter, f, &ignores, force, &redactor) {
             Ok(s) => {
                 total.files_seen += s.files_seen;
                 total.files_parsed += s.files_parsed;
@@ -172,6 +190,7 @@ fn run_paths(files: &[PathBuf], force: bool, quiet: bool) -> Result<i32> {
                 total.skipped_forgotten += s.skipped_forgotten;
                 total.report.api_errors_skipped += s.report.api_errors_skipped;
                 total.report.sidechain_records += s.report.sidechain_records;
+                total.report.subagent_files += s.report.subagent_files;
                 total.report.orphaned_records += s.report.orphaned_records;
                 total.report.orphaned_chars += s.report.orphaned_chars;
                 total.redacted_exchanges += s.redacted_exchanges;

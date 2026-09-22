@@ -260,19 +260,42 @@ pub fn doctor() -> Result<i32> {
         }
     }
 
-    let root = paths::claude_projects_dir()?;
-    let transcripts = crate::capture::claude_transcripts(&root).unwrap_or_default();
-    if transcripts.is_empty() {
-        problems += bad(&format!(
-            "no Claude Code transcripts under {}",
-            tilde(&root.to_string_lossy())
-        ));
-    } else {
-        ok(&format!(
-            "{} Claude Code transcript(s) under {}",
-            transcripts.len(),
-            tilde(&root.to_string_lossy())
-        ));
+    // Per adapter, because "no transcripts" means something different for each:
+    // a machine with Claude Code and no Codex is normal, and saying so as a
+    // problem would train the user to ignore this whole report.
+    let mut any = 0usize;
+    let mut discovered: Vec<(&'static str, std::path::PathBuf)> = Vec::new();
+    for adapter in crate::capture::adapters::all() {
+        let root = adapter.transcript_root()?;
+        // One walk, not two. `discover` is a recursive read_dir over a whole
+        // archive; doing it once for the count and again for the list doubled
+        // the cost of `doctor` for no reason.
+        let files = if root.exists() {
+            adapter.discover(&root).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let found = files.len();
+        any += found;
+        for f in files {
+            discovered.push((adapter.name(), f));
+        }
+        if found > 0 {
+            ok(&format!(
+                "{found} {} transcript(s) under {}",
+                adapter.name(),
+                tilde(&root.to_string_lossy())
+            ));
+        } else {
+            note(&format!(
+                "no {} transcripts under {} — nothing to capture from it",
+                adapter.name(),
+                tilde(&root.to_string_lossy())
+            ));
+        }
+    }
+    if any == 0 {
+        problems += bad("no transcripts found for any supported assistant");
     }
 
     match pause::state()? {
@@ -290,7 +313,7 @@ pub fn doctor() -> Result<i32> {
 
     if db_path.exists() {
         let conn = db::open(&db_path)?;
-        problems += report_coverage(&conn, &transcripts)?;
+        problems += report_coverage(&conn, &discovered)?;
     }
 
     println!();
@@ -306,16 +329,22 @@ pub fn doctor() -> Result<i32> {
 /// What ingest has and has not seen. This is the part that makes a silent
 /// parser failure loud: a transcript on disk with no watermark row means the
 /// file was never read, and that is invisible from `status` alone.
-fn report_coverage(conn: &Connection, transcripts: &[std::path::PathBuf]) -> Result<usize> {
+fn report_coverage(
+    conn: &Connection,
+    transcripts: &[(&'static str, std::path::PathBuf)],
+) -> Result<usize> {
     let mut problems = 0;
     let mut unseen = 0;
     let mut stale = 0;
-    for t in transcripts {
+    for (assistant, t) in transcripts {
         let p = t.to_string_lossy().into_owned();
+        // Keyed by assistant as well as path. Hardcoding `claude-code` here was
+        // harmless with one adapter and would have reported every Codex
+        // transcript as never ingested with two.
         let row: Option<(i64, i64)> = conn
             .query_row(
-                "SELECT bytes, mtime_ms FROM watermarks WHERE assistant = 'claude-code' AND source_path = ?1",
-                rusqlite::params![&p],
+                "SELECT bytes, mtime_ms FROM watermarks WHERE assistant = ?1 AND source_path = ?2",
+                rusqlite::params![assistant, &p],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .ok();
@@ -355,6 +384,13 @@ fn ok(msg: &str) {
 fn bad(msg: &str) -> usize {
     println!("  !!  {msg}");
     1
+}
+
+/// Neither healthy nor broken. A machine with one assistant installed and not
+/// another is the ordinary case, and reporting it as a problem is how a health
+/// check teaches people to stop reading it.
+fn note(msg: &str) {
+    println!("  --  {msg}");
 }
 
 fn human_bytes(n: u64) -> String {
