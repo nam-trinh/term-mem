@@ -14,7 +14,9 @@ mod common;
 
 use common::Env;
 use predicates::prelude::*;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 /// Install a fixture into an adapter-appropriate place in the fake tree.
 fn install_at(e: &Env, fixture: &str, rel: &str) -> PathBuf {
@@ -450,52 +452,57 @@ fn a_foreign_file_in_the_pty_directory_is_refused_loudly() {
 /// allowlist; what actually runs is a shell script pretending to be one, so the
 /// test does not need a model. What is under test is the part that is hard: raw
 /// mode, the echo, the ANSI stripping, and the Enter that ends a turn.
+///
+/// **Input is typed, not piped.** The first version wrote both lines at once
+/// and was flaky — it passed five CI runs and failed the sixth, because whether
+/// the quiescence timer had promoted and closed the turn before the child
+/// exited was a race. That race is real and documented (the PTY tier merges
+/// turns a REPL answers faster than the quiet window), but it is the *lossy*
+/// path, and asserting on it asserts on a coin flip. A flaky test is worse than
+/// no test: it teaches whoever sees it to press re-run, which is the lesson
+/// phase-4.md finding 10 already recorded about a different suite here.
+///
+/// So this writes one line, waits past the 300 ms quiet window, then writes the
+/// next — which is what a person at a REPL does, and is the case the feature
+/// actually supports.
 #[test]
 #[cfg_attr(not(unix), ignore)]
 fn a_live_pty_session_records_the_turns_a_user_typed() {
     let e = Env::new();
     e.cmd().args(["init", "--no-hook"]).assert().success();
+    let bin = fake_repl(&e);
 
-    // A fake REPL: prints a prompt, echoes an answer per line, exits on "bye".
-    let fake = e.home().join("bin/sgpt");
-    std::fs::create_dir_all(fake.parent().unwrap()).unwrap();
-    std::fs::write(
-        &fake,
-        "#!/bin/sh\nprintf '>>> '\nwhile IFS= read -r line; do\n  \
-         [ \"$line\" = bye ] && exit 0\n  \
-         printf '\\033[1;32mAnswer:\\033[0m use the concat demuxer with -c copy.\\n>>> '\n\
-         done\n",
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-
-    let path = std::env::var("PATH").unwrap_or_default();
-    let out = e
-        .cmd()
-        .env(
-            "PATH",
-            format!("{}:{}", fake.parent().unwrap().display(), path),
-        )
+    let mut child = Command::new(assert_cmd::cargo::cargo_bin("tmem"))
         .args(["run", "sgpt"])
-        .write_stdin("joining mp4 files\nbye\n")
-        .output()
+        .env("TMEM_HOME", e.home().join("data"))
+        .env("TMEM_CLAUDE_PROJECTS", e.projects())
+        .env("TMEM_CLAUDE_SETTINGS", e.settings())
+        .env("TMEM_CONFIG_DIR", e.home().join("no-config"))
+        .env("HOME", e.home())
+        .env("PATH", with_path(&bin))
+        .env_remove("TMEM")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
-    assert!(
-        out.status.success(),
-        "{:?}",
-        String::from_utf8_lossy(&out.stderr)
-    );
 
-    assert_eq!(
-        e.count("exchanges"),
-        1,
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        // Let the REPL print its banner before asking anything.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        stdin.write_all(b"joining mp4 files\n").unwrap();
+        stdin.flush().unwrap();
+        // Past the quiet window, so the turn is unambiguously finished.
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        stdin.write_all(b"bye\n").unwrap();
+        stdin.flush().unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "{stderr}");
+
+    assert_eq!(e.count("exchanges"), 1, "stderr: {stderr}");
     let prompt = e.query("SELECT prompt FROM exchanges").remove(0);
     let response = e.query("SELECT response FROM exchanges").remove(0);
     assert_eq!(prompt, "joining mp4 files");
@@ -512,6 +519,37 @@ fn a_live_pty_session_records_the_turns_a_user_typed() {
         !response.contains("bye"),
         "the queued line leaked: {response:?}"
     );
+}
+
+/// The lossy path, asserted on what it actually promises rather than on a
+/// race: piping a script of questions merges turns, and the command says so.
+#[test]
+#[cfg_attr(not(unix), ignore)]
+fn piped_input_may_merge_turns_and_always_reports_the_gap() {
+    let e = Env::new();
+    e.cmd().args(["init", "--no-hook"]).assert().success();
+    let bin = fake_repl(&e);
+
+    let out = e
+        .cmd()
+        .env("PATH", with_path(&bin))
+        .args(["run", "sgpt"])
+        .write_stdin("first question\nsecond question\nbye\n")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+
+    // However many turns survive — and it is genuinely timing-dependent — the
+    // count of what was sent and what was kept has to add up in the report.
+    let kept = e.count("exchanges");
+    assert!(kept <= 2, "more turns than questions: {kept}");
+    if kept < 2 {
+        assert!(
+            stderr.contains("produced no separate exchange"),
+            "turns were dropped without saying so: {stderr}"
+        );
+    }
 }
 
 // ── Regressions from the Phase 6 review, and from using the thing ────────

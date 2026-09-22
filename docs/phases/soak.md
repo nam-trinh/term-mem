@@ -126,4 +126,38 @@ bitten by once:
 
 ## Log
 
-_(Entries go here. A quiet week is worth recording as a quiet week.)_
+### 2026-09-22 — CI turned out to be gated on a scan that never ran
+
+Merging was blocked with *"Waiting for Code Scanning results. Code Scanning may
+not be configured for the target branch."* The cause was a repository ruleset,
+`main-protection`, carrying a `code_scanning` rule requiring CodeQL — while
+CodeQL had never been configured. The required result had no producer, so the
+gate could never resolve, for any PR.
+
+Two things worth keeping:
+
+- **CodeQL's default setup does not support Rust.** The API's `GET
+  default-setup` reports `languages: ["actions", "rust"]`, which reads like
+  support and is not — it is a list of languages *detected* in the repository.
+  `PATCH` rejects `rust` outright. So scanning here covers the workflow YAML and
+  nothing else, and the ruleset is satisfied by a scan that never looks at the
+  program. That is worth knowing before anyone trusts the badge.
+- Its first run flagged a real one anyway: `rust.yml` declared no `permissions`,
+  so CI inherited the repository default token scope it never used. Fixed.
+
+### 2026-09-22 — a flaky test, found by CI rather than by the suite
+
+`a_live_pty_session_records_the_turns_a_user_typed` failed once in six CI runs
+and passed on re-run. It drove the PTY tier with piped stdin, which is the path
+the tier documents as lossy: whether the quiescence timer closed the turn before
+the child exited was a race, so the assertion was on a coin flip.
+
+Rewritten to type the input with a pause past the quiet window — the case the
+feature actually supports — and it then failed *deterministically*, which is how
+a second real bug surfaced: the echo of the next question arrives while the
+current turn is still open, so it lands on the **end** of the answer.
+`clean_response` trimmed echoes only from the front, leaving responses ending
+`>>> bye`. Now trimmed from both ends. Fifteen consecutive local runs, green.
+
+The lossy path still has a test; it asserts what that path promises — that turns
+may merge and the command says so — instead of asserting a race.

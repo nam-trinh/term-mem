@@ -312,6 +312,18 @@ pub fn clean_response(raw: &str, prompt: &str, also_typed: &[String]) -> String 
         }
         break;
     }
+    // …and from the tail. The echo of the *next* question arrives while this
+    // turn is still open — the user types it, the pty echoes it, and the turn
+    // closes a moment later with someone else's words on the end. Trimming only
+    // the front left responses ending `>>> bye`.
+    while let Some(last) = lines.last() {
+        let l = last.trim();
+        if l.is_empty() || is_echo(l) {
+            lines.pop();
+            continue;
+        }
+        break;
+    }
     // A prompt marker left glued to the first real line of the answer.
     if let Some(first) = lines.first_mut() {
         let t = first.trim_start();
@@ -747,6 +759,24 @@ mod tests {
         assert_eq!(
             clean_response(raw, "joining mp4 files", &["bye".to_string()]),
             "Answer: joining mp4 files is handled by the concat demuxer."
+        );
+    }
+
+    /// The echo of the next question arrives while this turn is still open, so
+    /// it lands on the *end* of the answer rather than the start. Trimming only
+    /// the front left responses ending `>>> bye`.
+    #[test]
+    fn an_echo_at_the_tail_is_trimmed_too() {
+        let raw = "Answer: use the concat demuxer with -c copy.\n>>> bye";
+        assert_eq!(
+            clean_response(raw, "joining mp4 files", &["bye".to_string()]),
+            "Answer: use the concat demuxer with -c copy."
+        );
+        // A real answer that merely ends in a short line is left alone.
+        let raw = "Use -c copy.\nThat is all.";
+        assert_eq!(
+            clean_response(raw, "how", &["bye".to_string()]),
+            "Use -c copy.\nThat is all."
         );
     }
 
