@@ -336,5 +336,7 @@ moved.
   it has been invisible because no doc recorded it.~~ **Started 2026-09-22 —
   [soak.md](soak.md)**, which now exists so the next gap of this kind is visible
   in a document rather than only on the filesystem.
-- **Phase 5 is still blocked** on the same absence, for the same reason. See
-  [plan.md](../plan.md).
+- **Phase 5 is still blocked**, but on half of what blocked it before. The
+  archive now exists; what does not is any record of what the author searched
+  for, so "which queries failed in Phase 2" remains unanswerable at any archive
+  size. See [plan.md](../plan.md).

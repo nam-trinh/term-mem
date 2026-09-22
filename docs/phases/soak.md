@@ -53,15 +53,64 @@ Verified on day 0, against live data rather than fixtures:
 
 ### What to watch for
 
-The Exit criterion names three failures, and each needs a different check:
+The Exit criterion names three failures. Each needs a different check, and the
+first two are less well covered than they look.
 
-- **losing an exchange** — `tmem doctor` reports transcripts on disk with no
-  watermark row; that is the direct test.
-- **duplicating one** — the count should track the transcripts, and
-  `source_key` uniqueness is what prevents it. A duplicated exchange would show
-  as two rows with the same prompt and timestamp.
-- **noticing it running** — the hook budget is 5 ms and is measured, but the
-  thing being tested here is subjective and cannot be asserted.
+**Losing an exchange.** `tmem doctor` reports transcripts with no watermark row
+— but that only catches a *whole file* never ingested, plus one that has grown
+since. It cannot see an exchange dropped **inside** a file that was ingested,
+which is the loss mode [phase-1.md](phase-1.md) actually recorded: orphaned
+assistant records, unusable prompts, unparsable lines. Those have counters, and
+`capture` prints them:
+
+```
+2 new, 1 updated, from 2 transcript(s) (19 unchanged)
+  skipped: 0 unparsable, 45 unknown-type, 1 prompt(s) with no response, …
+```
+
+**And on the automatic path nobody sees that line.** The hook spawns the drainer
+with `--quiet` and its stderr pointed at `/dev/null`, which is deliberate — the
+turn boundary is not the place for a report — but it means the counters exist
+and are discarded on every real capture. So the check is to run
+`tmem capture --all` **by hand**, periodically, and read the `skipped` line. A
+non-zero `unparsable` or `unusable` is the signal; `prompt(s) with no response`
+is usually just a turn still in flight.
+
+*That the loss counters are invisible during normal operation is itself a
+finding, and arguably a defect. It is recorded here rather than fixed because
+what to do about it — a notice in `status`, a counter in the database, or
+nothing — is a design question the soak is better placed to answer than a guess
+is.*
+
+**Duplicating one.** The key is `(assistant, session_id, source_key)`, not
+`source_key` alone, and the database enforces it — so an exact repeat cannot
+happen. The realistic duplication mode is the same *content* arriving under a
+**different** key: a Codex session file rewritten in place would shift every
+positional key (the append-only assumption
+[codex-cli-format.md](codex-cli-format.md) carries forward as unverified), and a
+changed session id would do the same for either vendor.
+
+The detector is identical prompt **and** identical response under different
+keys:
+
+```sql
+SELECT prompt, response, COUNT(*) FROM exchanges
+GROUP BY prompt, response
+HAVING COUNT(DISTINCT assistant || '|' || session_id || '|' || source_key) > 1;
+```
+
+Not prompt text alone. [phase-1.md](phase-1.md) finding 4 rejects prompt-text
+matching as a dedup *rule* because asking the same question twice is legitimate
+history — and on day 0 this archive already has **six** repeated prompts and
+**zero** repeated prompt-and-response pairs, so the naive version would start
+with six false positives. Timestamps are no help either: Codex has 2,186 unique
+ones across 2,665 records.
+
+Even the query above is a signal to investigate rather than a verdict — re-asking
+and getting the same answer is possible.
+
+**Noticing it running.** The hook budget is 5 ms and is measured, but what is
+being tested here is subjective and cannot be asserted. Day 0: 2 ms mean.
 
 And two the criterion does not name, both of which this project has now been
 bitten by once:
@@ -72,7 +121,8 @@ bitten by once:
   then, because no test detects an injected wrapper nobody has seen before.
 - **a format that moved.** `capture` reports unrecognised record types; the
   archive currently reports `pr-link`, which is known. A *new* name appearing
-  there is the signal.
+  there is the signal — and it arrives on the same discarded stderr as the loss
+  counters, so it needs the same by-hand run to be seen.
 
 ## Log
 

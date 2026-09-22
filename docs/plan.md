@@ -296,14 +296,19 @@ enqueue and run away. It is held to the 100 ms search budget and **measured at
 
 **Blocked, and skipped in favour of Phase 6 on 2026-09-21.** Its Exit criterion
 is "measurably better recall on queries that failed in Phase 2 … if it can't
-beat BM25 on the author's own history, it doesn't ship." There is no such
-history: term-mem has never been run for real, so there is no archive, and no
-query log to say which queries failed. Building it would mean shipping
-embeddings against a gate nothing can pass or fail, which is precisely the
-"shipped for completeness" outcome *What would change this plan* says to avoid.
-**What unblocks it is use, not code** — the soak, and then the opt-in query log
-named below. **The soak began 2026-09-22**
-([phases/soak.md](phases/soak.md)), so the first half is running.
+beat BM25 on the author's own history, it doesn't ship." When that decision was
+taken there was no such history at all: term-mem had never been run, so there
+was no archive and no query log to say which queries failed. Building it would
+have meant shipping embeddings against a gate nothing could pass or fail, which
+is precisely the "shipped for completeness" outcome *What would change this
+plan* says to avoid.
+
+**Still blocked, and for a narrower reason now.** The archive exists as of
+2026-09-22 — [phases/soak.md](phases/soak.md) — so half the problem is
+dissolving on its own as the soak runs. What is still missing is the other
+half: **nothing records a query**, so "which queries failed" has no answer for
+any size of archive. **What unblocks it is use plus the opt-in query log named
+below**, in that order.
 
 *Only now, and only if the archive says it's needed.*
 
@@ -407,13 +412,16 @@ a turn rather than quietly keeping one of two. See
 as a separate mode rather than the default. **Not built.** It was the one
 optional item and nothing in six phases has wanted it.
 
-**Not done, and it is the largest thing outstanding in this project: nobody has
-ever used term-mem.** There is no `~/.local/share/term-mem/memory.db` on the
-author's machine. Phase 1's Exit criterion — "the author runs it against their
-own daily work for two weeks" — has been carried forward for five phases, and
-this is the phase that found out why: it was never started. Six phases of
-features, no day of real use, and no doc recorded the gap. See
-[phases/phase-6.md](phases/phase-6.md).
+**The largest thing this phase found: nobody had ever used term-mem.** There was
+no `~/.local/share/term-mem/memory.db` on the author's machine. Phase 1's Exit
+criterion — "the author runs it against their own daily work for two weeks" —
+had been carried forward for five phases, and this is the phase that found out
+why: it was never started. Six phases of features, no day of real use, and no
+doc recorded the gap. See [phases/phase-6.md](phases/phase-6.md).
+
+**Resolved on 2026-09-22**: installed, backfilled, and logged in
+[phases/soak.md](phases/soak.md). The gap is closed; the two weeks are not yet
+elapsed.
 
 ---
 
