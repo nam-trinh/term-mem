@@ -98,7 +98,12 @@ incorrectly is worse than useless, because the failures are silent.
   first commit that writes to disk, there must be a way to unwrite.
 
 **Exit:** the author runs it against their own daily work for two weeks without
-losing an exchange, duplicating one, or noticing it running.
+losing an exchange, duplicating one, or noticing it running. **Started
+2026-09-22 — [phases/soak.md](phases/soak.md).** It had not been started before
+and no document said so, which Phase 6 found out by looking for the archive and
+not finding one. Day 0 verified the hook firing, a 2 ms mean latency on a real
+1,329-record transcript, the upsert completing an in-progress exchange rather
+than duplicating it, and redaction firing on real content.
 
 **Budget:** hook latency under 5ms. Measured, not assumed — a hook on the turn
 boundary is in the user's way by construction. **Measured: p95 2.35 ms**, and
@@ -297,7 +302,8 @@ query log to say which queries failed. Building it would mean shipping
 embeddings against a gate nothing can pass or fail, which is precisely the
 "shipped for completeness" outcome *What would change this plan* says to avoid.
 **What unblocks it is use, not code** — the soak, and then the opt-in query log
-named below.
+named below. **The soak began 2026-09-22**
+([phases/soak.md](phases/soak.md)), so the first half is running.
 
 *Only now, and only if the archive says it's needed.*
 
