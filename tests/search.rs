@@ -735,3 +735,65 @@ fn re_ingest_repairs_a_row_whose_repo_was_not_yet_resolvable() {
         "half a session is worse than none of it: --repo would return one row"
     );
 }
+
+// ── A term that matches nothing must not vanish ──────────────────────────
+
+/// Found by using the tool, not by testing it: `tmem phase5 block` returns
+/// exactly what `tmem block` returns, because "Phase 5" is two tokens and
+/// `phase5` is a third that occurs nowhere. Terms are OR-ed, so a dead term
+/// does not narrow anything — it disappears, and the results look like an
+/// answer to the whole query. The user has no way to tell.
+#[test]
+fn a_query_term_that_matches_nothing_is_reported() {
+    let e = Env::new();
+    e.cmd().args(["init", "--no-hook"]).assert().success();
+    scenario_one(&e);
+    e.cmd().args(["capture", "--all"]).assert().success();
+
+    let with_dead = e.cmd().args(["ffmpeg2", "concat"]).output().unwrap();
+    let live_only = e.cmd().args(["concat"]).output().unwrap();
+    assert_eq!(
+        with_dead.stdout, live_only.stdout,
+        "a dead term should not change the results"
+    );
+    assert_eq!(with_dead.status.code(), Some(0));
+
+    let err = String::from_utf8(with_dead.stderr).unwrap();
+    assert!(err.contains("'ffmpeg2' matched nothing"), "{err}");
+    assert!(err.contains("'concat'"), "it names what did match: {err}");
+    // And the hint is concrete, because `phase5` -> `phase 5` is the shape that
+    // actually bites.
+    assert!(err.contains("ffmpeg 2"), "no concrete suggestion: {err}");
+}
+
+/// A query where every term is dead says so, and still exits 1.
+#[test]
+fn a_query_where_nothing_matches_says_that_too() {
+    let e = Env::new();
+    e.cmd().args(["init", "--no-hook"]).assert().success();
+    scenario_one(&e);
+    e.cmd().args(["capture", "--all"]).assert().success();
+
+    let out = e.cmd().args(["zzzqqq", "wwwvvv"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("no term in that query appears"), "{err}");
+    assert!(err.contains("Browsing is the backstop"), "{err}");
+}
+
+/// A query whose terms all match says nothing at all — a note on every search
+/// is a note nobody reads.
+#[test]
+fn a_query_that_fully_matches_is_silent() {
+    let e = Env::new();
+    e.cmd().args(["init", "--no-hook"]).assert().success();
+    scenario_one(&e);
+    e.cmd().args(["capture", "--all"]).assert().success();
+
+    let out = e.cmd().args(["ffmpeg", "concat"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        String::from_utf8(out.stderr).unwrap().is_empty(),
+        "a fully-matching query should be quiet"
+    );
+}

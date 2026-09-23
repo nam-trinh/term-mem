@@ -975,3 +975,27 @@ fn mcp_registration_is_detected_where_claude_actually_writes_it() {
         .success()
         .stdout(predicates::str::contains("mcp         registered in"));
 }
+
+/// An agent is even less able than a person to notice that half its query was
+/// ignored, so the dead terms go in the envelope rather than only to a terminal
+/// nobody is reading.
+#[test]
+fn the_agent_surface_reports_a_query_term_that_matched_nothing() {
+    let e = Env::new();
+    archive(&e);
+    let out = e
+        .cmd()
+        .args([
+            "call",
+            "search_memory",
+            "--args",
+            r#"{"query":"ffmpeg2 concat"}"#,
+        ])
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let note = v["note"].as_str().unwrap_or_default();
+    assert!(note.contains("ffmpeg2"), "{note}");
+    assert!(note.contains("matched nothing"), "{note}");
+    assert!(v["count"].as_u64().unwrap() >= 1, "the live term still ran");
+}
