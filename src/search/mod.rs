@@ -7,7 +7,7 @@
 
 use crate::db::queries::{self, Exchange, Filter};
 use anyhow::{bail, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 /// Column weights for `bm25()`, in the column order of `exchanges_fts`.
 ///
@@ -93,6 +93,75 @@ pub fn build_match(terms: &[String]) -> Result<String> {
     Ok(parts.join(" OR "))
 }
 
+/// Query terms that match nothing anywhere in the archive.
+///
+/// Terms are OR-ed, so a term matching nothing does not narrow the result — it
+/// simply vanishes, and the results look like an answer to the whole query.
+/// `tmem phase5 block` returns exactly what `tmem block` returns, because
+/// "Phase 5" is tokenized as two tokens and `phase5` is a third that occurs
+/// nowhere. The user has no way to tell, which makes it the failure mode this
+/// project keeps naming: it does not look like a failure.
+///
+/// The probe is a `LIMIT 1` existence check per term, which asks FTS5 for the
+/// first docid in a posting list rather than ranking it. It is deliberately run
+/// through `MATCH` rather than against `fts5vocab` so the term goes through the
+/// same porter stemming as the query it came from.
+/// Above this many terms the probe is skipped entirely.
+///
+/// Each probe measured ~3.4 ms against a 100k-exchange archive, which is fine
+/// for the two or three words a person types and is not fine multiplied by the
+/// twenty-four a machine can extract from a prompt. A long term list is also
+/// where the advice is worthless — "nine of your twenty-four words are not in
+/// the archive" is noise, not help.
+const MAX_PROBED_TERMS: usize = 8;
+
+pub fn dead_terms(conn: &Connection, terms: &[String]) -> Result<Vec<String>> {
+    if terms.len() > MAX_PROBED_TERMS {
+        return Ok(Vec::new());
+    }
+    let mut stmt =
+        conn.prepare("SELECT 1 FROM exchanges_fts WHERE exchanges_fts MATCH ?1 LIMIT 1")?;
+    let mut dead = Vec::new();
+    for t in terms {
+        if !t.chars().any(char::is_alphanumeric) {
+            continue; // punctuation-only terms are dropped before the query
+        }
+        let expr = format!("\"{}\"", t.replace('"', "\"\""));
+        let found = stmt
+            .query_row([&expr], |r| r.get::<_, i64>(0))
+            .optional()?
+            .is_some();
+        if !found {
+            dead.push(t.clone());
+        }
+    }
+    Ok(dead)
+}
+
+/// `phase5` → `phase 5`, so the hint about a dead term can be concrete.
+///
+/// Only splits at a letter/digit boundary, which is the shape that actually
+/// bites: names like `Phase 5`, `V3`, `utf8` are written both ways by the same
+/// person, and the tokenizer keeps them as one token while the archive holds
+/// two. Returns `None` when there is nothing to suggest.
+pub fn split_alnum_boundary(term: &str) -> Option<String> {
+    let mut out = String::with_capacity(term.len() + 1);
+    let mut chars = term.chars().peekable();
+    let mut split = false;
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if let Some(&n) = chars.peek() {
+            if c.is_ascii_alphabetic() && n.is_ascii_digit()
+                || c.is_ascii_digit() && n.is_ascii_alphabetic()
+            {
+                out.push(' ');
+                split = true;
+            }
+        }
+    }
+    split.then_some(out)
+}
+
 pub fn search(conn: &Connection, terms: &[String], filter: &Filter) -> Result<Vec<Hit>> {
     let expr = build_match(terms)?;
     let (where_sql, filter_args) = filter.clauses();
@@ -148,6 +217,34 @@ mod tests {
     fn matched_terms_come_back_out_of_the_markers() {
         let s = format!("a {HL_OPEN}Concat{HL_CLOSE} b {HL_OPEN}ffmpeg{HL_CLOSE}");
         assert_eq!(matched_terms(&s), vec!["concat", "ffmpeg"]);
+    }
+
+    /// The hint for a dead term has to be concrete to be useful, and `phase5`
+    /// is the shape that bites: one token to the tokenizer, two words in the
+    /// archive.
+    #[test]
+    fn a_run_together_name_suggests_where_the_space_goes() {
+        assert_eq!(split_alnum_boundary("phase5").as_deref(), Some("phase 5"));
+        assert_eq!(split_alnum_boundary("v3").as_deref(), Some("v 3"));
+        assert_eq!(
+            split_alnum_boundary("utf8mb4").as_deref(),
+            Some("utf 8 mb 4")
+        );
+        // Nothing to suggest for an ordinary word or an already-split one.
+        assert_eq!(split_alnum_boundary("deletion"), None);
+        assert_eq!(split_alnum_boundary(""), None);
+        assert_eq!(split_alnum_boundary("redaction"), None);
+    }
+
+    /// The probe costs a query per term, so a machine-generated term list must
+    /// not stack them. Measured at ~3.4 ms each against 100k exchanges.
+    #[test]
+    fn a_long_term_list_is_not_probed() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        // No FTS table exists, so any probe would error — returning empty
+        // proves it did not run.
+        let many: Vec<String> = (0..20).map(|i| format!("word{i}")).collect();
+        assert!(dead_terms(&conn, &many).unwrap().is_empty());
     }
 
     #[test]

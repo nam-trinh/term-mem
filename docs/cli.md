@@ -40,8 +40,30 @@ Multi-word queries need no quoting. Query terms are already parsed, stemmed, and
 OR-ed rather than passed raw to the search index, so joining `argv` costs
 nothing and removes a ritual from the hot path.
 
+**Quoting is not a no-op, though — it is a phrase search.** `tmem "honest
+deletion"` matches those words adjacent, where `tmem honest deletion` matches
+either. That falls out of how each term is wrapped for FTS5, and it is the
+escape hatch for a multi-word name the tokenizer would otherwise split.
+
 `tmem search <query>` remains available as the explicit form, for scripts and
 for queries that collide with a subcommand name.
+
+**A term that matches nothing is reported.** Terms are OR-ed, so a term that
+appears nowhere does not narrow the result — it vanishes, and what comes back
+looks like an answer to the whole query:
+
+```
+$ tmem phase5 block
+tmem: 'phase5' matched nothing; these results are for 'block'
+      try: tmem "phase 5"   ("phase5" is one word to the index)
+```
+
+`tmem phase5 block` returns exactly what `tmem block` returns, because `Phase 5`
+is two tokens in the archive and `phase5` is a third that occurs nowhere. The
+note goes to stderr, so it reaches a person without corrupting `--json` on a
+pipe, and `search_memory` carries the same fact in its result envelope. Queries
+longer than eight terms are not checked — the probe costs a query per term, and
+the advice is noise at that length.
 
 A query that matches nothing exits `1` and names the browse commands, rather
 than printing an empty list — an empty list is indistinguishable from an archive

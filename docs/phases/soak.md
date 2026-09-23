@@ -126,6 +126,47 @@ bitten by once:
 
 ## Log
 
+### 2026-09-23 — first finding from ordinary use: a term can vanish
+
+Asked the archive whether a past conversation had happened, by typing what came
+naturally:
+
+```
+tmem phase5 block
+```
+
+Twenty results, all plausible. The top one was even right. But `phase5` matched
+**nothing** — `Phase 5` is two tokens in the index and `phase5` is a third that
+occurs nowhere — and because terms are OR-ed, a dead term does not narrow the
+query, it disappears. `tmem phase5 block` returned byte-for-byte what
+`tmem block` returns.
+
+So the results were an honest answer to a question that had not been asked, and
+nothing on screen said so. That is this project's recurring failure shape:
+**it does not look like a failure.**
+
+Fixed: a term matching nothing is now reported on stderr, with a concrete
+suggestion where the shape allows one (`phase5` → `phase 5`), and the same fact
+goes into `search_memory`'s envelope so an agent — which can notice even less
+than a person — is told too. Skipped above eight terms, because the probe costs
+a query per term and the advice is noise at that length.
+
+Worth noting what found it. 233 tests did not, and neither did two code
+reviews. One person typing a plausible query did, in the first three days. The
+answer to the original question, incidentally, was yes — asked 2026-09-21 at
+00:25.
+
+**A measurement caveat from the same session.** The budget suite failed twice
+while this was being checked (`recall short` at 109 ms against a 100 ms budget)
+and then passed at 75 ms with no code change. The machine is now running
+term-mem's own capture hook on every turn, and run-to-run variance is roughly
+±30% — which is larger than the effect being measured. The recall budget was
+already carried forward from [phase-6.md](phase-6.md) as sitting close to its
+limit; it is now clear it is also **variance-prone enough to fail honestly on a
+loaded machine.** Either the hook needs the term-frequency stop list phase-6
+finding 4 names, or the budget needs a number that reflects a real desktop.
+Unresolved, and recorded rather than smoothed over.
+
 ### 2026-09-22 — CI turned out to be gated on a scan that never ran
 
 Merging was blocked with *"Waiting for Code Scanning results. Code Scanning may

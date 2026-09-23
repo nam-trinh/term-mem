@@ -380,6 +380,17 @@ fn search_memory(conn: &Connection, args: &Value) -> Result<Value> {
     let terms: Vec<String> = query.split_whitespace().map(str::to_string).collect();
     let hits = search::search(conn, &terms, &filter)?;
     let results: Vec<Value> = hits.iter().map(hit_value).collect();
+    // An agent is even less able than a person to notice that half its query
+    // was ignored, so the dead terms go in the envelope rather than only to a
+    // terminal nobody is reading.
+    let dead = search::dead_terms(conn, &terms).unwrap_or_default();
+    let dead_note = (!dead.is_empty() && dead.len() < terms.len()).then(|| {
+        format!(
+            "These query terms matched nothing and were ignored: {}. The results answer the \
+             remaining terms only.",
+            dead.join(", ")
+        )
+    });
     let note = if results.is_empty() {
         Some(
             "Nothing matched. Keyword recall fails whenever the user cannot reconstruct the \
@@ -388,6 +399,11 @@ fn search_memory(conn: &Connection, args: &Value) -> Result<Value> {
         )
     } else {
         None
+    };
+    let note = match (dead_note, note) {
+        (Some(d), Some(n)) => Some(format!("{d} {n}")),
+        (Some(d), None) => Some(d),
+        (None, n) => n,
     };
     Ok(envelope(TOOL, results, clamped, note))
 }
